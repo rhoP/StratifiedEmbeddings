@@ -34,6 +34,7 @@ AirfRANS specifics
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 import math
 import random
@@ -102,11 +103,23 @@ class AirfRANSDataset:
         norm_stats: tuple[torch.Tensor, torch.Tensor,
                           torch.Tensor, torch.Tensor] | None = None,
         indices: list[int] | None = None,
+        _shared_raw: AirfRANS | None = None,
+        _shared_edge_cache: dict[int, torch.Tensor] | None = None,
     ) -> None:
-        # No pre_transform — edges never touch disk.
-        self._raw = AirfRANS(root=root, task=task, train=(split == "train"))
+        # Re-use a caller-supplied AirfRANS instance when available so that
+        # multiple views (train, val, normalisation) never duplicate the
+        # in-memory dataset.  If none is supplied we create our own.
+        self._raw: AirfRANS = (
+            _shared_raw
+            if _shared_raw is not None
+            else AirfRANS(root=root, task=task, train=(split == "train"))
+        )
         self._knn = KNNGraph(k=knn_k, loop=False, force_undirected=True)
-        self._edge_cache: dict[int, torch.Tensor] = {}
+        # Similarly share the edge-index cache so KNN is built at most once
+        # per unique graph across all views.
+        self._edge_cache: dict[int, torch.Tensor] = (
+            _shared_edge_cache if _shared_edge_cache is not None else {}
+        )
         n = len(self._raw)
         self._indices: list[int] = (
             list(indices) if indices is not None else list(range(n))
@@ -252,6 +265,11 @@ def collect_embeddings(
     Per-graph quota = max_embed_nodes // len(dataset), so total samples stay
     within budget regardless of dataset size.  Full-graph inference runs under
     no_grad; only a random subset is kept in CPU RAM.
+
+    Each graph's device tensors are explicitly freed after encoding so that
+    GPU memory from one graph is released before the next is loaded.
+    Call ``torch.cuda.empty_cache()`` before invoking this function to
+    maximise headroom (optimizer states from Phase 1 may still be cached).
     """
     model.eval()
     quota = max(1, max_embed_nodes // len(dataset))
@@ -265,6 +283,7 @@ def collect_embeddings(
             idx = torch.randperm(n, device=device)[:quota]
             e = e[idx]
         all_embeds.append(e.cpu())
+        del d, e   # free device tensors before loading the next graph
     return torch.cat(all_embeds, dim=0)
 
 
@@ -285,9 +304,9 @@ def kmeans_cluster(
 
     labels = torch.zeros(N, dtype=torch.long)
     for _ in range(n_iter):
-        diff = embeds.unsqueeze(1) - centroids.unsqueeze(0)  # (N, K, d)
-        dists = (diff**2).sum(-1)  # (N, K)
-        new_labels = dists.argmin(dim=-1)  # (N,)
+        # cdist avoids materialising the (N, K, d) diff tensor.
+        dists = torch.cdist(embeds, centroids)  # (N, K) squared-euclidean
+        new_labels = dists.argmin(dim=-1)       # (N,)
 
         if (new_labels == labels).all():
             break
@@ -383,36 +402,47 @@ def train(args: argparse.Namespace) -> None:
     )
     print(f"Device: {device}")
 
-    # ── Load data (lazy — one graph at a time, never all in RAM) ─────────────
+    # ── Load data ─────────────────────────────────────────────────────────────
+    # One AirfRANS instance per split, shared across every dataset view.
+    # PyG's AirfRANS is an InMemoryDataset — each extra instance duplicates
+    # the entire split in RAM.  Sharing also means KNN is built once per
+    # unique graph (edges land in the shared cache, not per-view copies).
     print(f"Loading AirfRANS (task={args.task}) …")
-    train_raw = AirfRANSDataset(
-        args.data_root, "train", task=args.task, knn_k=args.knn_k
-    )
-    n_total   = len(train_raw)
-    val_size  = max(1, int(n_total * 0.1))
+    raw_train = AirfRANS(root=args.data_root, task=args.task, train=True)
+    raw_test  = AirfRANS(root=args.data_root, task=args.task, train=False)
+    edge_cache_train: dict[int, torch.Tensor] = {}
+    edge_cache_test:  dict[int, torch.Tensor] = {}
+
+    n_total  = len(raw_train)
+    val_size = max(1, int(n_total * 0.1))
     train_indices: list[int] = list(range(n_total - val_size))
     val_indices:   list[int] = list(range(n_total - val_size, n_total))
 
     print("  Computing normalisation stats (streaming) …")
-    norm_stats = compute_normalisation_streaming(
-        AirfRANSDataset(
-            args.data_root, "train", task=args.task,
-            knn_k=args.knn_k, indices=train_indices,
-        )
+    norm_ds = AirfRANSDataset(
+        args.data_root, "train", task=args.task, knn_k=args.knn_k,
+        indices=train_indices,
+        _shared_raw=raw_train, _shared_edge_cache=edge_cache_train,
     )
+    norm_stats = compute_normalisation_streaming(norm_ds)
+    del norm_ds
+    gc.collect()  # wrapper gone; shared raw + edge cache stay alive via train_edge_cache
     _, _, y_mean, y_std = norm_stats
 
     train_dataset = AirfRANSDataset(
-        args.data_root, "train", task=args.task,
-        knn_k=args.knn_k, norm_stats=norm_stats, indices=train_indices,
+        args.data_root, "train", task=args.task, knn_k=args.knn_k,
+        norm_stats=norm_stats, indices=train_indices,
+        _shared_raw=raw_train, _shared_edge_cache=edge_cache_train,
     )
     val_dataset = AirfRANSDataset(
-        args.data_root, "train", task=args.task,
-        knn_k=args.knn_k, norm_stats=norm_stats, indices=val_indices,
+        args.data_root, "train", task=args.task, knn_k=args.knn_k,
+        norm_stats=norm_stats, indices=val_indices,
+        _shared_raw=raw_train, _shared_edge_cache=edge_cache_train,
     )
     test_dataset = AirfRANSDataset(
-        args.data_root, "test", task=args.task,
-        knn_k=args.knn_k, norm_stats=norm_stats,
+        args.data_root, "test", task=args.task, knn_k=args.knn_k,
+        norm_stats=norm_stats,
+        _shared_raw=raw_test, _shared_edge_cache=edge_cache_test,
     )
 
     in_dim = train_dataset.in_dim
@@ -472,9 +502,8 @@ def train(args: argparse.Namespace) -> None:
         n_batches = 0
         train_dataset.shuffle()
         for data in train_dataset:
-            for batch in make_neighbor_loader(
-                data, args.batch_size, args.num_neighbors
-            ):
+            loader = make_neighbor_loader(data, args.batch_size, args.num_neighbors)
+            for batch in loader:
                 batch = batch.to(device)
                 n_seed = batch.batch_size
                 opt1.zero_grad()
@@ -485,6 +514,7 @@ def train(args: argparse.Namespace) -> None:
                 opt1.step()
                 ep_loss += loss.item()
                 n_batches += 1
+            del loader  # release reference to full-graph tensors
         sched1.step()
         avg = ep_loss / max(1, n_batches)
         if (epoch + 1) % max(1, args.warmup_epochs // 5) == 0:
@@ -494,9 +524,10 @@ def train(args: argparse.Namespace) -> None:
 
     # ── Phase 2: K-means initialisation ───────────────────────────────────────
     print("\n=== Phase 2: K-means clustering ===")
+    torch.cuda.empty_cache()  # reclaim optimizer-state cache from Phase 1
     all_embeds = collect_embeddings(model, train_dataset, device, args.max_embed_nodes)
     centres, labels = kmeans_cluster(all_embeds, args.n_strata, seed=args.seed)
-    model.init_from_kmeans(centres.to(device), labels, all_embeds.to(device))
+    model.init_from_kmeans(centres, labels, all_embeds)  # all stay on CPU
     print(
         f"  Cluster sizes: {[(labels == k).sum().item() for k in range(args.n_strata)]}"
     )
@@ -519,9 +550,8 @@ def train(args: argparse.Namespace) -> None:
         n_batches = 0
         train_dataset.shuffle()
         for data in train_dataset:
-            for batch in make_neighbor_loader(
-                data, args.batch_size, args.num_neighbors
-            ):
+            loader = make_neighbor_loader(data, args.batch_size, args.num_neighbors)
+            for batch in loader:
                 batch = batch.to(device)
                 n_seed = batch.batch_size
                 opt2.zero_grad()
@@ -538,6 +568,7 @@ def train(args: argparse.Namespace) -> None:
                 opt2.step()
                 ep_loss += loss.item()
                 n_batches += 1
+            del loader
         if (epoch + 1) % max(1, args.assigner_epochs // 5) == 0:
             print(
                 f"  [assigner] epoch {epoch + 1:3d}  ce={ep_loss / max(1, n_batches):.4f}"
@@ -565,9 +596,8 @@ def train(args: argparse.Namespace) -> None:
 
         n_batches = 0
         for data in train_dataset:
-            for batch in make_neighbor_loader(
-                data, args.batch_size, args.num_neighbors
-            ):
+            loader = make_neighbor_loader(data, args.batch_size, args.num_neighbors)
+            for batch in loader:
                 batch = batch.to(device)
                 n_seed = batch.batch_size
                 opt3.zero_grad()
@@ -632,6 +662,7 @@ def train(args: argparse.Namespace) -> None:
                 for k, v in breakdown.items():
                     ep_break[k] = ep_break.get(k, 0.0) + v
                 n_batches += 1
+            del loader  # release reference to full-graph tensors
 
         sched3.step()
 
@@ -647,6 +678,7 @@ def train(args: argparse.Namespace) -> None:
         kappa_hist.append(kappas_now)
 
         if (epoch + 1) % max(1, args.full_epochs // 10) == 0:
+            torch.cuda.empty_cache()
             val_metrics = evaluate(
                 model, val_dataset, device, y_mean, y_std, surf_weight=args.surf_weight
             )
@@ -676,6 +708,7 @@ def train(args: argparse.Namespace) -> None:
     ckpt = torch.load(out_dir / "checkpoint.pt", map_location=device)
     model.load_state_dict(ckpt["model"])
 
+    torch.cuda.empty_cache()
     test_metrics = evaluate(
         model, test_dataset, device, y_mean, y_std, surf_weight=args.surf_weight
     )

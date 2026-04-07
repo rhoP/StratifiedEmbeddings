@@ -16,7 +16,7 @@ import numpy as np
 import pickle
 import matplotlib.pyplot as plt
 from tqdm import tqdm
-from scipy.interpolate import griddata, RBFInterpolator
+from scipy.interpolate import griddata, RBFInterpolator, LinearNDInterpolator
 from scipy.spatial import distance_matrix
 
 # Try to import PyTorch
@@ -76,36 +76,24 @@ class ReferenceDomain:
         """
         Interpolate field onto reference grid.
 
+        Builds a Delaunay triangulation once via LinearNDInterpolator and
+        evaluates all channels in a single call, avoiding the N-channel loop
+        over griddata that previously re-triangulated ~180k points per channel.
+
         Args:
             coordinates: Nx2 or Nx3 array of coordinates
-            field_values: Nx1 or NxM array of field values
+            field_values: (N,) or (N, M) array of field values
 
         Returns:
-            grid_field: HxW or HxWxM interpolated field
+            grid_field: (H, W) or (H, W, M) interpolated field
         """
-        # Use 2D coordinates
-        if coordinates.shape[1] == 3:
-            coords_2d = coordinates[:, :2]
-        else:
-            coords_2d = coordinates
+        coords_2d = coordinates[:, :2] if coordinates.shape[1] == 3 else coordinates
 
-        # Interpolate
-        if field_values.ndim == 1:
-            # Scalar field
-            grid_field = griddata(coords_2d, field_values,
-                                 (self.grid_x, self.grid_y),
-                                 method='linear', fill_value=0)
-        else:
-            # Vector field
-            n_components = field_values.shape[1]
-            grid_field = np.zeros((*self.grid_size, n_components))
+        H, W = self.grid_size
+        interp = LinearNDInterpolator(coords_2d, field_values, fill_value=0.0)
+        result = interp(self.ref_coords)  # (H*W,) or (H*W, M)
 
-            for i in range(n_components):
-                grid_field[:, :, i] = griddata(coords_2d, field_values[:, i],
-                                              (self.grid_x, self.grid_y),
-                                              method='linear', fill_value=0)
-
-        return grid_field
+        return result.reshape(H, W) if field_values.ndim == 1 else result.reshape(H, W, field_values.shape[1])
 
 
 class MeshMorpher:

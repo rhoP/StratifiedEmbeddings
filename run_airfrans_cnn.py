@@ -106,6 +106,9 @@ class GraphGrid:
     """Per-graph patch representation built from an interpolated flow grid.
 
     All tensors are on CPU; moved to device inside training loops.
+    Node-level arrays (targets, surf mask, grid indices) are NOT cached here —
+    they are recomputed on-the-fly from the raw dataset during evaluation to
+    keep the per-entry cache size small (~14 MB patches only, not ~21 MB).
 
     Attributes
     ----------
@@ -113,20 +116,12 @@ class GraphGrid:
     patch_targets : (P, T)       — mean normalised target per patch
     patch_surf    : (P,)  bool   — True if any surface node falls in the patch region
     positions     : (P, 2) int   — (row, col) top-left corner of each patch in the grid
-    node_pos      : (N, 2)       — original CFD node coordinates
-    node_targets  : (N, T)       — original normalised targets (used for eval metrics)
-    node_surf     : (N,)  bool   — surface mask from AirfRANS
-    node_grid_rc  : (N, 2) int   — (row, col) grid indices for each node
     """
 
     patches: torch.Tensor
     patch_targets: torch.Tensor
     patch_surf: torch.Tensor
     positions: torch.Tensor
-    node_pos: torch.Tensor
-    node_targets: torch.Tensor
-    node_surf: torch.Tensor
-    node_grid_rc: torch.Tensor
 
 
 # ── Dataset ───────────────────────────────────────────────────────────────────
@@ -141,7 +136,8 @@ class AirfRANSGridDataset:
 
     A single ``AirfRANS`` instance can be shared across multiple views (train,
     val, normalisation) via the ``_shared_raw`` parameter to avoid duplicating
-    the dataset in memory.
+    the dataset in memory.  Pass the same ``_shared_cache`` dict to train and
+    val views so that graphs accessed by both are interpolated only once.
 
     Parameters
     ----------
@@ -150,6 +146,10 @@ class AirfRANSGridDataset:
         When None, raw values are used (suitable for the normalisation pass).
     _shared_raw : AirfRANS | None
         Pre-loaded AirfRANS instance to share.  If None, one is created.
+    _shared_cache : dict[int, GraphGrid] | None
+        GraphGrid cache keyed by raw_idx.  Share between views that use the
+        same raw dataset and norm_stats to avoid building the same grid twice.
+        If None, a fresh private cache is created.
     """
 
     def __init__(
@@ -161,6 +161,7 @@ class AirfRANSGridDataset:
         | None = None,
         indices: list[int] | None = None,
         _shared_raw: AirfRANS | None = None,
+        _shared_cache: dict[int, "GraphGrid"] | None = None,
     ) -> None:
         self._raw: AirfRANS = (
             _shared_raw
@@ -182,8 +183,10 @@ class AirfRANSGridDataset:
             patch_size=(PATCH_H, PATCH_W), stride=PATCH_STRIDE
         )
 
-        # Grid cache: raw_idx → GraphGrid (None = not yet computed)
-        self._cache: dict[int, GraphGrid] = {}
+        # Grid cache: raw_idx → GraphGrid.  May be shared with other views.
+        self._cache: dict[int, GraphGrid] = (
+            _shared_cache if _shared_cache is not None else {}
+        )
 
     # ── public API ────────────────────────────────────────────────────────────
 
@@ -202,6 +205,39 @@ class AirfRANSGridDataset:
 
     def shuffle(self) -> None:
         random.shuffle(self._order)
+
+    def get_node_eval(
+        self, pos: int
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return (node_targets_norm, node_surf, node_grid_rc) for graph at *pos*.
+
+        Recomputes from raw data on every call — not cached — so that the
+        GraphGrid cache stays small (patches only, ~14 MB/graph instead of ~21 MB).
+        """
+        raw_idx = self._indices[self._order[pos]]
+        raw: Data = self._raw[raw_idx]  # type: ignore[assignment]
+
+        pos_ = cast(torch.Tensor, raw.pos).float()
+        y = cast(torch.Tensor, raw.y).float()
+        surf = (
+            cast(torch.Tensor, raw.surf).bool()
+            if hasattr(raw, "surf") and raw.surf is not None
+            else torch.zeros(pos_.shape[0], dtype=torch.bool)
+        )
+
+        if self.norm_stats is not None:
+            _, _, y_mean, y_std = self.norm_stats
+            y = (y - y_mean) / y_std
+
+        x_min, x_max = DOMAIN_BOUNDS["x_min"], DOMAIN_BOUNDS["x_max"]
+        y_min, y_max = DOMAIN_BOUNDS["y_min"], DOMAIN_BOUNDS["y_max"]
+        col_f = (pos_[:, 0] - x_min) / (x_max - x_min) * (GRID_W - 1)
+        row_f = (pos_[:, 1] - y_min) / (y_max - y_min) * (GRID_H - 1)
+        col_i = col_f.round().long().clamp(0, GRID_W - 1)
+        row_i = row_f.round().long().clamp(0, GRID_H - 1)
+        node_grid_rc = torch.stack([row_i, col_i], dim=-1)  # (N, 2)
+
+        return y, surf, node_grid_rc
 
     # ── internals ─────────────────────────────────────────────────────────────
 
@@ -264,24 +300,11 @@ class AirfRANSGridDataset:
             )
             patch_surf[pi] = grid_s_t[ri : ri + PATCH_H, ci : ci + PATCH_W].max() > 0.1
 
-        # ── Node → grid index mapping ─────────────────────────────────────
-        x_min, x_max = DOMAIN_BOUNDS["x_min"], DOMAIN_BOUNDS["x_max"]
-        y_min, y_max = DOMAIN_BOUNDS["y_min"], DOMAIN_BOUNDS["y_max"]
-        col_f = (pos_[:, 0] - x_min) / (x_max - x_min) * (GRID_W - 1)
-        row_f = (pos_[:, 1] - y_min) / (y_max - y_min) * (GRID_H - 1)
-        col_i = col_f.round().long().clamp(0, GRID_W - 1)
-        row_i = row_f.round().long().clamp(0, GRID_H - 1)
-        node_grid_rc = torch.stack([row_i, col_i], dim=-1)  # (N, 2)
-
         return GraphGrid(
             patches=patches_t,
             patch_targets=patch_targets,
             patch_surf=patch_surf,
             positions=positions_t,
-            node_pos=pos_.clone(),
-            node_targets=torch.from_numpy(y_np).float(),
-            node_surf=surf.clone(),
-            node_grid_rc=node_grid_rc,
         )
 
 
@@ -670,19 +693,21 @@ def evaluate(
     true_sq = torch.zeros(N_TARGETS)
     total_n = 0
 
-    for gg in dataset:
+    for i in range(len(dataset)):
+        gg = dataset[i]
+        node_targets_norm, smask, node_grid_rc = dataset.get_node_eval(i)
+
         patches_d = gg.patches.to(device)  # (P, C, h, w)
         pred_p, _, _, _, _, _ = model(patches_d)  # (P, T) normalised
         pred_p_cpu = pred_p.cpu()
         del patches_d, pred_p
 
         pred_n = reconstruct_node_predictions(
-            pred_p_cpu, gg.positions, gg.node_grid_rc
+            pred_p_cpu, gg.positions, node_grid_rc
         )  # (N, T) normalised
 
         pred_dn = pred_n * y_std_cpu + y_mean_cpu  # (N, T) denormalised
-        true_dn = gg.node_targets * y_std_cpu + y_mean_cpu  # (N, T) denormalised
-        smask = gg.node_surf  # (N,)
+        true_dn = node_targets_norm * y_std_cpu + y_mean_cpu  # (N, T) denormalised
 
         se = (pred_dn - true_dn) ** 2
         surf_se += se[smask].sum(0)
@@ -753,9 +778,11 @@ def train(args: argparse.Namespace) -> None:
     _, _, y_mean, y_std = norm_stats
 
     # ── Build datasets ─────────────────────────────────────────────────────
-    # Grid caches are independent per dataset object; that is intentional:
-    # train/val/test have different norm_stats (test reuses train's) and
-    # there is no KNN edge cache to share (no edge building at all).
+    # train and val share both raw_train and norm_stats, so their GraphGrid
+    # objects are identical for any given raw_idx.  One shared cache means
+    # each graph is interpolated at most once regardless of which view first
+    # accesses it.  test uses raw_test → separate cache.
+    train_val_cache: dict[int, GraphGrid] = {}
     train_dataset = AirfRANSGridDataset(
         args.data_root,
         "train",
@@ -763,6 +790,7 @@ def train(args: argparse.Namespace) -> None:
         norm_stats=norm_stats,
         indices=train_indices,
         _shared_raw=raw_train,
+        _shared_cache=train_val_cache,
     )
     val_dataset = AirfRANSGridDataset(
         args.data_root,
@@ -771,6 +799,7 @@ def train(args: argparse.Namespace) -> None:
         norm_stats=norm_stats,
         indices=val_indices,
         _shared_raw=raw_train,
+        _shared_cache=train_val_cache,
     )
     test_dataset = AirfRANSGridDataset(
         args.data_root,
@@ -890,8 +919,7 @@ def train(args: argparse.Namespace) -> None:
             opt2.zero_grad()
             with torch.no_grad():
                 emb = model.encode(patches_d)  # (P, d)
-                diff = emb.unsqueeze(1) - centres_gpu.unsqueeze(0)
-                pseudo_labels = (diff**2).sum(-1).argmin(dim=-1)  # (P,)
+                pseudo_labels = torch.cdist(emb, centres_gpu).argmin(dim=-1)  # (P,)
             soft = model.assigner(emb)
             loss = F.nll_loss(soft.clamp(min=1e-8).log(), pseudo_labels)
             loss.backward()
