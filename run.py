@@ -50,6 +50,7 @@ from typing import cast
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
+from tqdm import tqdm
 import torch.nn as nn
 import torch.nn.functional as F
 from scipy.interpolate import griddata
@@ -462,7 +463,7 @@ def evaluate_pressure(
     res_sq = true_sum = true_sq = 0.0
     total_n = 0
 
-    for i in range(len(dataset)):
+    for i in tqdm(range(len(dataset)), desc="evaluate", leave=False, unit="graph"):
         gg = dataset[i]
         p_norm_node, smask, node_grid_rc = dataset.get_node_pressure_eval(i)
 
@@ -519,7 +520,7 @@ def collect_airfoil_embeddings(
     representations: list[torch.Tensor] = []
     mean_pressures: list[float] = []
 
-    for i in range(len(dataset)):
+    for i in tqdm(range(len(dataset)), desc="collect embeddings", leave=False, unit="graph"):
         gg = dataset[i]
         _, _, iv_w, _ = model(gg.patches.to(device))  # iv_w: (P, n_intervals)
         representations.append(iv_w.mean(0).cpu())    # (n_intervals,) — quantile histogram
@@ -689,9 +690,6 @@ def train(args: argparse.Namespace) -> None:
         model.load_state_dict(ckpt["model"])
         print(f"Resumed from {args.resume}")
 
-    p_mean_d = p_mean.to(device)
-    p_std_d = p_std.to(device)
-
     history: dict[str, list[float]] = {
         "total": [], "regression": [], "centripetal": [], "spread": [],
     }
@@ -705,13 +703,14 @@ def train(args: argparse.Namespace) -> None:
     )
     sched1 = CosineAnnealingLR(opt1, T_max=max(1, args.warmup_epochs))
 
-    for epoch in range(args.warmup_epochs):
+    epoch_bar1 = tqdm(range(args.warmup_epochs), desc="warmup", unit="ep")
+    for epoch in epoch_bar1:
         model.train()
         ep_loss = 0.0
         n_graphs = 0
         train_ds.shuffle()
 
-        for gg in train_ds:
+        for gg in tqdm(train_ds, desc="  graphs", leave=False, unit="g"):
             patches_d = gg.patches.to(device)
             targets_d = gg.patch_pressure.unsqueeze(-1).to(device)  # (P, 1)
 
@@ -727,11 +726,7 @@ def train(args: argparse.Namespace) -> None:
             del patches_d, targets_d, pred
 
         sched1.step()
-        if (epoch + 1) % max(1, args.warmup_epochs // 5) == 0:
-            print(
-                f"  [warmup] epoch {epoch + 1:3d}  "
-                f"loss={ep_loss / max(1, n_graphs):.4f}"
-            )
+        epoch_bar1.set_postfix(loss=f"{ep_loss / max(1, n_graphs):.4f}")
 
     # ── Phase 2: Full DQE training ─────────────────────────────────────────
     print(f"\n=== Phase 2: Full DQE training ({args.full_epochs} epochs) ===")
@@ -745,14 +740,15 @@ def train(args: argparse.Namespace) -> None:
     best_val_mse = math.inf
     best_epoch = 0
 
-    for epoch in range(args.full_epochs):
+    epoch_bar2 = tqdm(range(args.full_epochs), desc="full DQE", unit="ep")
+    for epoch in epoch_bar2:
         model.train()
         ep_reg = ep_cent = 0.0
         n_graphs = 0
         train_ds.shuffle()
 
         ep_spread = 0.0
-        for gg in train_ds:
+        for gg in tqdm(train_ds, desc="  graphs", leave=False, unit="g"):
             patches_d = gg.patches.to(device)
             targets_d = gg.patch_pressure.unsqueeze(-1).to(device)  # (P, 1)
             surf_d = gg.patch_surf.to(device)                        # (P,)
@@ -802,14 +798,17 @@ def train(args: argparse.Namespace) -> None:
             (ep_reg + args.centripetal_weight * ep_cent + args.spread_weight * ep_spread) / ng
         )
 
+        epoch_bar2.set_postfix(
+            reg=f"{history['regression'][-1]:.4f}",
+            cent=f"{history['centripetal'][-1]:.4f}",
+        )
+
         if (epoch + 1) % max(1, args.full_epochs // 10) == 0:
             torch.cuda.empty_cache()
             val_m = evaluate_pressure(model, val_ds, device, args.surf_weight)
             kappa = model.dqe.kappa.item()
-            print(
-                f"  [full] epoch {epoch + 1:3d}  "
-                f"reg={history['regression'][-1]:.4f}  "
-                f"cent={history['centripetal'][-1]:.4f}  "
+            epoch_bar2.write(
+                f"  epoch {epoch + 1:3d}  "
                 f"val_mse={val_m['weighted_mse']:.4f}  "
                 f"val_r2={val_m['r2_pressure']:.3f}  "
                 f"kappa={kappa:.3f}"
@@ -822,6 +821,12 @@ def train(args: argparse.Namespace) -> None:
                         "model": model.state_dict(),
                         "epoch": epoch + 1,
                         "val_metrics": val_m,
+                        "norm_stats": {
+                            "x_mean": x_mean.cpu(),
+                            "x_std": x_std.cpu(),
+                            "p_mean": p_mean.cpu(),
+                            "p_std": p_std.cpu(),
+                        },
                     },
                     out_dir / "checkpoint.pt",
                 )
