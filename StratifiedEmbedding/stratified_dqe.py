@@ -434,23 +434,33 @@ class StratifiedDQE(nn.Module):
     @torch.no_grad()
     def init_from_kmeans(
         self,
-        cluster_centres: torch.Tensor,  # (K, d)
-        assign_labels:   torch.Tensor,  # (N,) hard labels used to init proto
-        all_embeds:      torch.Tensor,  # (N, d) encoder outputs
+        cluster_centres: torch.Tensor,  # (K, d) — any device
+        assign_labels:   torch.Tensor,  # (N,)   — CPU preferred
+        all_embeds:      torch.Tensor,  # (N, d) — CPU preferred
     ) -> None:
-        """Warm-start assigner centroids and DQE prototypes."""
-        K = self.n_strata
-        self.assigner.init_centroids(cluster_centres)
+        """Warm-start assigner centroids and DQE prototypes.
+
+        All inputs may live on CPU.  ``init_centroids`` uses ``copy_()``
+        which handles cross-device transfer automatically.  The per-stratum
+        boolean indexing and randperm are done on CPU; only the tiny proto
+        slice (P × d) is transferred to the model device via ``copy_()``.
+        This avoids pushing the full N-row embed matrix to GPU.
+        """
+        self.assigner.init_centroids(cluster_centres)   # copy_() inside — device-agnostic
+
+        # Keep heavy tensors on CPU; only small slices go to device.
+        labels_cpu = assign_labels.cpu()
+        embeds_cpu = all_embeds.cpu()
 
         dqe_list: list[StratumDQE] = [m for m in self.dqes if isinstance(m, StratumDQE)]
         for k, dqe in enumerate(dqe_list):
-            mask = assign_labels == k
+            mask = labels_cpu == k
             if mask.sum() == 0:
                 continue
-            cluster_embeds = all_embeds[mask]                     # (Nk, d)
+            cluster_embeds = embeds_cpu[mask]                     # (Nk, d) on CPU
             P = dqe.n_protos
-            # sub-sample P points as proto initialisation
-            idx = torch.randperm(cluster_embeds.shape[0])[:P]
+            idx = torch.randperm(cluster_embeds.shape[0])[:P]    # CPU randperm
             if idx.numel() > 0:
                 n = idx.numel()
-                dqe.protos_tan.data[:n] = cluster_embeds[idx]
+                # copy_() transfers only the P proto vectors to the model device.
+                dqe.protos_tan.data[:n].copy_(cluster_embeds[idx])
