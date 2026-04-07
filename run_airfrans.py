@@ -53,6 +53,7 @@ from torch_geometric.loader import NeighborLoader
 
 from StratifiedEmbedding import (
     StratifiedDQE,
+    StratumDQE,
     total_loss,
     prediction_diversity_loss,
     conditional_diversity_loss,
@@ -73,54 +74,115 @@ BASE_IN_DIM = 5  # raw AirfRANS node features (excl. spatial pos)
 # ── Data utilities ───────────────────────────────────────────────────────────
 
 
-def load_airfrans(root: str, split: str, knn_k: int = 8) -> list[Data]:
-    """Load AirfRANS split, build KNN edges, prepend pos to features.
+class AirfRANSDataset:
+    """On-disk per-sample cache for memory-efficient loading.
 
-    Returns a list of Data objects, each with:
-      x          (N, 7)  float32
-      edge_index (2, E)  long
-      y          (N, 4)  float32
-      surf       (N,)    bool
-      pos        (N, 2)  float32
+    On first use, processes all raw AirfRANS graphs (KNN edge construction +
+    feature augmentation) and writes individual .pt files under
+    <root>/_cache_knn<k>/<split>/.  Subsequent accesses load graphs one at a
+    time from cache — the full dataset is never in RAM simultaneously.
+
+    Normalisation is applied on-the-fly so the cached tensors remain in their
+    original scale and can be reused with different normalisations without
+    re-processing.
     """
-    transform = KNNGraph(k=knn_k, loop=False, force_undirected=True)
-    ds = AirfRANS(root=root, task="full", train=(split == "train"), transform=transform)
 
-    data_list: list[Data] = []
-    for sample in ds:
-        # AirfRANS: x shape (N, 5), pos shape (N, 2)
-        x = sample.x.float() if sample.x is not None else sample.pos.float()
-        pos = (
-            sample.pos.float() if sample.pos is not None else torch.zeros(x.shape[0], 2)
+    def __init__(
+        self,
+        root: str,
+        split: str,
+        knn_k: int = 8,
+        norm_stats: tuple[torch.Tensor, torch.Tensor,
+                          torch.Tensor, torch.Tensor] | None = None,
+        indices: list[int] | None = None,
+    ) -> None:
+        self._cache_dir = Path(root) / f"_cache_knn{knn_k}" / split
+        self._build_cache(root, split, knn_k)
+        all_paths = sorted(self._cache_dir.glob("*.pt"))
+        self._paths: list[Path] = (
+            [all_paths[i] for i in indices] if indices is not None else all_paths
         )
-        # Concatenate spatial position as extra features
-        x_aug = torch.cat([pos, x], dim=-1)  # (N, 7)
+        self._order: list[int] = list(range(len(self._paths)))
+        self.norm_stats = norm_stats
 
-        y = (
-            sample.y.float()
-            if sample.y is not None
-            else torch.zeros(x.shape[0], N_TARGETS)
-        )
+    # ── public API ─────────────────────────────────────────────────────────────
 
-        surf = (
-            sample.surf.bool()
-            if hasattr(sample, "surf") and sample.surf is not None
-            else torch.zeros(x_aug.shape[0], dtype=torch.bool)
-        )
+    @property
+    def in_dim(self) -> int:
+        """Feature dimension — peeked from first cached graph."""
+        data: Data = torch.load(self._paths[0], map_location="cpu")  # type: ignore[assignment]
+        assert data.x is not None
+        return int(data.x.shape[1])
 
-        edge_index = sample.edge_index.long()
+    def __len__(self) -> int:
+        return len(self._paths)
 
-        data_list.append(
-            Data(
-                x=x_aug,
-                edge_index=edge_index,
-                y=y,
-                surf=surf,
-                pos=pos,
-                num_nodes=x_aug.shape[0],
+    def __getitem__(self, pos: int) -> Data:
+        data: Data = torch.load(
+            self._paths[self._order[pos]], map_location="cpu"
+        )  # type: ignore[assignment]
+        if self.norm_stats is not None:
+            x_mean, x_std, y_mean, y_std = self.norm_stats
+            assert data.x is not None and data.y is not None
+            data.x = (data.x - x_mean) / x_std
+            data.y = (cast(torch.Tensor, data.y) - y_mean) / y_std
+        return data
+
+    def __iter__(self):
+        for i in range(len(self)):
+            yield self[i]
+
+    def shuffle(self) -> None:
+        """Randomly permute the iteration order for the next epoch."""
+        random.shuffle(self._order)
+
+    # ── cache construction (runs once) ─────────────────────────────────────────
+
+    def _build_cache(self, root: str, split: str, knn_k: int) -> None:
+        """Write per-sample .pt files; skipped if marker file already exists."""
+        marker = self._cache_dir / ".done"
+        if marker.exists():
+            return
+
+        self._cache_dir.mkdir(parents=True, exist_ok=True)
+        print(f"Building '{split}' cache (knn_k={knn_k}) — runs once …")
+        transform = KNNGraph(k=knn_k, loop=False, force_undirected=True)
+        raw = AirfRANS(root=root, task="full", train=(split == "train"),
+                       transform=transform)
+
+        for i, sample in enumerate(raw):
+            x = sample.x.float() if sample.x is not None else sample.pos.float()
+            pos = (
+                sample.pos.float()
+                if sample.pos is not None
+                else torch.zeros(x.shape[0], 2)
             )
-        )
-    return data_list
+            x_aug = torch.cat([pos, x], dim=-1)   # (N, 7)
+            y = (
+                sample.y.float()
+                if sample.y is not None
+                else torch.zeros(x_aug.shape[0], N_TARGETS)
+            )
+            surf = (
+                sample.surf.bool()
+                if hasattr(sample, "surf") and sample.surf is not None
+                else torch.zeros(x_aug.shape[0], dtype=torch.bool)
+            )
+            torch.save(
+                Data(
+                    x=x_aug,
+                    edge_index=sample.edge_index.long(),
+                    y=y,
+                    surf=surf,
+                    num_nodes=x_aug.shape[0],
+                ),
+                self._cache_dir / f"{i:04d}.pt",
+            )
+            if (i + 1) % 100 == 0 or (i + 1) == len(raw):
+                print(f"  cached {i + 1}/{len(raw)}")
+
+        marker.touch()
+        print("  Cache ready.")
 
 
 def make_neighbor_loader(
@@ -151,27 +213,40 @@ def make_neighbor_loader(
 # ── Normalisation ─────────────────────────────────────────────────────────────
 
 
-def compute_normalisation(
-    data_list: list[Data],
+def compute_normalisation_streaming(
+    dataset: AirfRANSDataset,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Compute per-feature mean/std over training set for x and y."""
-    xs = torch.cat([d.x for d in data_list], dim=0)
-    ys = torch.cat([d.y for d in data_list], dim=0)
-    x_mean, x_std = xs.mean(0), xs.std(0).clamp(min=1e-6)
-    y_mean, y_std = ys.mean(0), ys.std(0).clamp(min=1e-6)
+    """Streaming mean/std over all graphs — never holds more than one graph in RAM.
+
+    Uses the online accumulation formula:
+        mean  = Σx / N
+        var   = Σx² / N − mean²   (cancelled by clamp to handle fp rounding)
+    """
+    # Peek at first graph to learn feature dimensions, then initialise accumulators.
+    first = dataset[0]
+    assert first.x is not None
+    x0 = first.x.float()
+    y0 = cast(torch.Tensor, first.y).float()
+    x_sum  = torch.zeros(x0.shape[1])
+    x_sum2 = torch.zeros(x0.shape[1])
+    y_sum  = torch.zeros(y0.shape[1])
+    y_sum2 = torch.zeros(y0.shape[1])
+    n_x = n_y = 0
+
+    for data in dataset:
+        assert data.x is not None
+        x = data.x.float()                        # (N, Fx)
+        y = cast(torch.Tensor, data.y).float()    # (N, Fy)
+        x_sum  += x.sum(0);  x_sum2 += (x ** 2).sum(0)
+        y_sum  += y.sum(0);  y_sum2 += (y ** 2).sum(0)
+        n_x += x.shape[0]
+        n_y += y.shape[0]
+
+    x_mean = x_sum / n_x
+    x_std  = ((x_sum2 / n_x) - x_mean ** 2).clamp(min=0).sqrt().clamp(min=1e-6)
+    y_mean = y_sum / n_y
+    y_std  = ((y_sum2 / n_y) - y_mean ** 2).clamp(min=0).sqrt().clamp(min=1e-6)
     return x_mean, x_std, y_mean, y_std
-
-
-def normalise(
-    data: Data,
-    x_mean: torch.Tensor,
-    x_std: torch.Tensor,
-    y_mean: torch.Tensor,
-    y_std: torch.Tensor,
-) -> Data:
-    data.x = (data.x - x_mean) / x_std
-    data.y = (data.y - y_mean) / y_std
-    return data
 
 
 # ── Training helpers ──────────────────────────────────────────────────────────
@@ -180,20 +255,27 @@ def normalise(
 @torch.no_grad()
 def collect_embeddings(
     model: StratifiedDQE,
-    data_list: list[Data],
+    dataset: AirfRANSDataset,
     device: torch.device,
+    max_embed_nodes: int = 500_000,
 ) -> torch.Tensor:
-    """Run encoder over all training samples; return concatenated embeds.
+    """Sample embeddings from each graph for k-means — never all at once.
 
-    Always uses the full graph — k-means needs embeddings for every node,
-    and no_grad inference is memory-efficient enough on full AirfRANS graphs.
+    Per-graph quota = max_embed_nodes // len(dataset), so total samples stay
+    within budget regardless of dataset size.  Full-graph inference runs under
+    no_grad; only a random subset is kept in CPU RAM.
     """
     model.eval()
-    all_embeds = []
-    for data in data_list:
+    quota = max(1, max_embed_nodes // len(dataset))
+    all_embeds: list[torch.Tensor] = []
+    for data in dataset:
         d = data.to(device)
         assert d.x is not None and d.edge_index is not None
-        e = model.encode(d.x, d.edge_index)
+        e = model.encode(d.x, d.edge_index)   # (N, d)  — on device
+        n = e.shape[0]
+        if n > quota:
+            idx = torch.randperm(n, device=device)[:quota]
+            e = e[idx]
         all_embeds.append(e.cpu())
     return torch.cat(all_embeds, dim=0)
 
@@ -209,7 +291,7 @@ def kmeans_cluster(
     Returns (centroids (K, d), labels (N,)).
     """
     torch.manual_seed(seed)
-    N, d = embeds.shape
+    N = embeds.shape[0]
     perm = torch.randperm(N)[:n_clusters]
     centroids = embeds[perm].clone()
 
@@ -231,50 +313,69 @@ def kmeans_cluster(
     return centroids, labels
 
 
+@torch.no_grad()
 def evaluate(
     model: StratifiedDQE,
-    data_list: list[Data],
+    dataset: AirfRANSDataset,
     device: torch.device,
     y_mean: torch.Tensor,
     y_std: torch.Tensor,
     surf_weight: float = 10.0,
 ) -> dict[str, float]:
-    """Compute weighted MSE and per-target R² on a data list (full graphs)."""
+    """Streaming weighted MSE and per-target R² — never holds all predictions in RAM.
+
+    Accumulates per-graph squared errors and sufficient statistics for R²
+    (true_sum, true_sq) so the final metrics are computed from running sums.
+    """
     model.eval()
-    all_pred, all_true, all_surf = [], [], []
-    with torch.no_grad():
-        for data in data_list:
-            d = data.to(device)
-            assert d.x is not None and d.edge_index is not None
-            y_t = cast(torch.Tensor, d.y)
-            surf_t = cast(torch.Tensor, d.surf)
-            pred, _, _, _, _, _ = model(d.x, d.edge_index)
-            all_pred.append(pred.cpu())
-            all_true.append(y_t.cpu())
-            all_surf.append(surf_t.cpu())
+    y_mean_cpu = y_mean.cpu()
+    y_std_cpu  = y_std.cpu()
 
-    pred = torch.cat(all_pred, dim=0)
-    true = torch.cat(all_true, dim=0)
-    surf = torch.cat(all_surf, dim=0)
+    surf_se = torch.zeros(N_TARGETS)   # Σ squared errors on surface nodes (per target)
+    vol_se  = torch.zeros(N_TARGETS)   # Σ squared errors on volume  nodes
+    surf_n  = 0
+    vol_n   = 0
 
-    # Denormalise
-    pred_dn = pred * y_std + y_mean
-    true_dn = true * y_std + y_mean
+    res_sq   = torch.zeros(N_TARGETS)  # Σ (pred − true)² per target
+    true_sum = torch.zeros(N_TARGETS)  # Σ true, for computing global mean
+    true_sq  = torch.zeros(N_TARGETS)  # Σ true², for computing Var[true]
+    total_n  = 0
 
-    mse_w = float(
-        F.mse_loss(pred_dn[surf], true_dn[surf]) * surf_weight
-        + F.mse_loss(pred_dn[~surf], true_dn[~surf])
-    ) / (surf_weight + 1)
+    for data in dataset:
+        d = data.to(device)
+        assert d.x is not None and d.edge_index is not None
+        y_t    = cast(torch.Tensor, d.y)
+        surf_t = cast(torch.Tensor, d.surf)
+        pred_d, _, _, _, _, _ = model(d.x, d.edge_index)
+        pred_dn = (pred_d * y_std + y_mean).cpu()          # (N, T) denormalised
+        true_dn = y_t.cpu() * y_std_cpu + y_mean_cpu       # (N, T)
+        smask   = surf_t.cpu().bool()                       # (N,)
 
-    r2_per = []
-    for t in range(N_TARGETS):
-        var_res = float(((pred_dn[:, t] - true_dn[:, t]) ** 2).mean())
-        var_tot = float(true_dn[:, t].var().clamp(min=1e-12))
-        r2_per.append(1.0 - var_res / var_tot)
+        se = (pred_dn - true_dn) ** 2                      # (N, T)
+        surf_se += se[smask].sum(0)
+        vol_se  += se[~smask].sum(0)
+        surf_n  += int(smask.sum())
+        vol_n   += int((~smask).sum())
+
+        res_sq   += se.sum(0)
+        true_sum += true_dn.sum(0)
+        true_sq  += (true_dn ** 2).sum(0)
+        total_n  += true_dn.shape[0]
+
+    # Weighted MSE: average per-element error, weighted by node type
+    T        = N_TARGETS
+    surf_mse = float(surf_se.sum()) / max(surf_n * T, 1)
+    vol_mse  = float(vol_se.sum())  / max(vol_n  * T, 1)
+    mse_w    = (surf_mse * surf_weight + vol_mse) / (surf_weight + 1)
+
+    # R² = 1 − Σ(pred−true)² / (N · Var[true])
+    true_mean = true_sum / total_n
+    true_var  = (true_sq / total_n - true_mean ** 2).clamp(min=1e-12)
+    r2_per    = (1.0 - res_sq / (total_n * true_var)).tolist()
 
     return {
         "weighted_mse": mse_w,
-        **{f"r2_{TARGET_NAMES[t]}": r2_per[t] for t in range(N_TARGETS)},
+        **{f"r2_{TARGET_NAMES[t]}": float(r2_per[t]) for t in range(N_TARGETS)},
         "r2_mean": float(np.mean(r2_per)),
     }
 
@@ -294,25 +395,39 @@ def train(args: argparse.Namespace) -> None:
     )
     print(f"Device: {device}")
 
-    # ── Load data ─────────────────────────────────────────────────────────────
-    print("Loading AirfRANS …")
-    train_list = load_airfrans(args.data_root, "train", knn_k=args.knn_k)
-    test_list = load_airfrans(args.data_root, "test", knn_k=args.knn_k)
+    # ── Load data (lazy — one graph at a time, never all in RAM) ─────────────
+    print("Building / loading data cache …")
+    train_raw = AirfRANSDataset(args.data_root, "train", knn_k=args.knn_k)
+    n_total   = len(train_raw)
+    val_size  = max(1, int(n_total * 0.1))
+    train_indices: list[int] = list(range(n_total - val_size))
+    val_indices:   list[int] = list(range(n_total - val_size, n_total))
 
-    x_mean, x_std, y_mean, y_std = compute_normalisation(train_list)
-    train_list = [normalise(d, x_mean, x_std, y_mean, y_std) for d in train_list]
-    test_list = [normalise(d, x_mean, x_std, y_mean, y_std) for d in test_list]
+    print("  Computing normalisation stats (streaming) …")
+    norm_stats = compute_normalisation_streaming(
+        AirfRANSDataset(
+            args.data_root, "train", knn_k=args.knn_k, indices=train_indices
+        )
+    )
+    _, _, y_mean, y_std = norm_stats
 
-    assert train_list[0].x is not None
-    in_dim = train_list[0].x.shape[1]  # should be 7
-    print(f"  Train graphs: {len(train_list)}, in_dim={in_dim}")
+    train_dataset = AirfRANSDataset(
+        args.data_root, "train",
+        knn_k=args.knn_k, norm_stats=norm_stats, indices=train_indices,
+    )
+    val_dataset = AirfRANSDataset(
+        args.data_root, "train",
+        knn_k=args.knn_k, norm_stats=norm_stats, indices=val_indices,
+    )
+    test_dataset = AirfRANSDataset(
+        args.data_root, "test",
+        knn_k=args.knn_k, norm_stats=norm_stats,
+    )
 
-    # Optional validation split (last 10% of train)
-    val_size = max(1, int(len(train_list) * 0.1))
-    val_list = train_list[-val_size:]
-    train_list = train_list[:-val_size]
+    in_dim = train_dataset.in_dim
     print(
-        f"  Using {len(train_list)} train / {len(val_list)} val / {len(test_list)} test"
+        f"  {len(train_dataset)} train / {len(val_dataset)} val / "
+        f"{len(test_dataset)} test graphs, in_dim={in_dim}"
     )
 
     # ── Build model ────────────────────────────────────────────────────────────
@@ -364,8 +479,8 @@ def train(args: argparse.Namespace) -> None:
         model.train()
         ep_loss = 0.0
         n_batches = 0
-        random.shuffle(train_list)
-        for data in train_list:
+        train_dataset.shuffle()
+        for data in train_dataset:
             for batch in make_neighbor_loader(
                 data, args.batch_size, args.num_neighbors
             ):
@@ -388,7 +503,7 @@ def train(args: argparse.Namespace) -> None:
 
     # ── Phase 2: K-means initialisation ───────────────────────────────────────
     print("\n=== Phase 2: K-means clustering ===")
-    all_embeds = collect_embeddings(model, train_list, device)
+    all_embeds = collect_embeddings(model, train_dataset, device, args.max_embed_nodes)
     centres, labels = kmeans_cluster(all_embeds, args.n_strata, seed=args.seed)
     model.init_from_kmeans(centres.to(device), labels, all_embeds.to(device))
     print(
@@ -411,8 +526,8 @@ def train(args: argparse.Namespace) -> None:
         model.train()
         ep_loss = 0.0
         n_batches = 0
-        random.shuffle(train_list)
-        for data in train_list:
+        train_dataset.shuffle()
+        for data in train_dataset:
             for batch in make_neighbor_loader(
                 data, args.batch_size, args.num_neighbors
             ):
@@ -455,10 +570,10 @@ def train(args: argparse.Namespace) -> None:
     for epoch in range(args.full_epochs):
         model.train()
         ep_break: dict[str, float] = {k: 0.0 for k in history}
-        random.shuffle(train_list)
+        train_dataset.shuffle()
 
         n_batches = 0
-        for data in train_list:
+        for data in train_dataset:
             for batch in make_neighbor_loader(
                 data, args.batch_size, args.num_neighbors
             ):
@@ -534,15 +649,15 @@ def train(args: argparse.Namespace) -> None:
 
         with torch.no_grad():
             kappas_now = [
-                float(dqe.kappa.item())
-                for dqe in model.dqes  # type: ignore[union-attr]
-                if hasattr(dqe, "kappa")
+                dqe.kappa.item()  # type: ignore[union-attr]
+                for dqe in model.dqes
+                if isinstance(dqe, StratumDQE)
             ]
         kappa_hist.append(kappas_now)
 
         if (epoch + 1) % max(1, args.full_epochs // 10) == 0:
             val_metrics = evaluate(
-                model, val_list, device, y_mean, y_std, surf_weight=args.surf_weight
+                model, val_dataset, device, y_mean, y_std, surf_weight=args.surf_weight
             )
             print(
                 f"  [full] epoch {epoch + 1:3d}  "
@@ -571,7 +686,7 @@ def train(args: argparse.Namespace) -> None:
     model.load_state_dict(ckpt["model"])
 
     test_metrics = evaluate(
-        model, test_list, device, y_mean, y_std, surf_weight=args.surf_weight
+        model, test_dataset, device, y_mean, y_std, surf_weight=args.surf_weight
     )
     print("Test metrics:")
     for k, v in test_metrics.items():
@@ -593,7 +708,8 @@ def train(args: argparse.Namespace) -> None:
         plot_curvature_evolution(kappa_hist, out_dir / "curvature_evolution.png")
 
     # Stratum assignment plot (first test sample, no subsampling)
-    sample = test_list[0].to(device)
+    sample = test_dataset[0].to(device)
+    assert sample.x is not None and sample.edge_index is not None
     model.eval()
     with torch.no_grad():
         embeds_vis = model.encode(sample.x, sample.edge_index)
@@ -609,15 +725,15 @@ def train(args: argparse.Namespace) -> None:
 
     plot_prediction_scatter(
         pred_vis,
-        sample.y,
+        cast(torch.Tensor, sample.y),
         out_dir / "prediction_scatter.png",
         surf_mask=sample.surf,
     )
 
     final_kappas = [
-        float(dqe.kappa.item())
-        for dqe in model.dqes  # type: ignore[union-attr]
-        if hasattr(dqe, "kappa")
+        dqe.kappa.item()  # type: ignore[union-attr]
+        for dqe in model.dqes
+        if isinstance(dqe, StratumDQE)
     ]
     plot_geometry_summary(final_kappas, out_dir / "geometry_summary.png")
 
@@ -725,6 +841,15 @@ def _parse_args() -> argparse.Namespace:
     # Misc
     p.add_argument("--out_dir", default="results/airfrans", help="Output directory")
     p.add_argument("--seed", type=int, default=42)
+    p.add_argument(
+        "--max_embed_nodes",
+        type=int,
+        default=500_000,
+        help=(
+            "Max total nodes sampled from the training set for k-means "
+            "(budget is distributed evenly across graphs, so RAM stays bounded)."
+        ),
+    )
     p.add_argument(
         "--cpu", action="store_true", help="Force CPU even if CUDA available"
     )
