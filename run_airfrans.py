@@ -75,21 +75,22 @@ BASE_IN_DIM = 5  # raw AirfRANS node features (excl. spatial pos)
 
 
 class AirfRANSDataset:
-    """Lazy per-sample loader backed by PyG's own processed cache.
+    """Lazy per-sample loader that builds KNN edges on first access.
 
-    Uses ``pre_transform=KNNGraph`` so edges are built once and stored in
-    ``<root>/airfrans/processed/``.  No secondary cache is created — disk
-    usage equals the PyG processed folder only.
+    PyG's raw ``AirfRANS`` files (~8 MB each, no edges) are loaded one at a
+    time.  On the first access to each graph, a KNN graph is built from node
+    positions and the resulting ``edge_index`` is stored in a RAM dict.
+    Subsequent accesses reuse the cached tensor — no KNN recomputation, no
+    extra disk files.
 
-    Feature augmentation (prepend spatial pos to x) and normalisation are
-    applied on-the-fly at load time, so the stored tensors remain in their
-    original scale.
+    For the "scarce" task (~200 graphs, default) the edge cache is ~4–5 GB.
+    For "full" (~800 graphs) it scales proportionally; use --task full only
+    when you have the RAM to spare.
 
     Parameters
     ----------
     task : "scarce" | "full"
-        AirfRANS task split.  "scarce" (~200 simulations) is the default;
-        "full" (~800 training simulations) is available via --task full.
+        AirfRANS task variant.  "scarce" is the default.
     """
 
     def __init__(
@@ -102,13 +103,10 @@ class AirfRANSDataset:
                           torch.Tensor, torch.Tensor] | None = None,
         indices: list[int] | None = None,
     ) -> None:
-        pre_transform = KNNGraph(k=knn_k, loop=False, force_undirected=True)
-        self._raw = AirfRANS(
-            root=root,
-            task=task,
-            train=(split == "train"),
-            pre_transform=pre_transform,
-        )
+        # No pre_transform — edges never touch disk.
+        self._raw = AirfRANS(root=root, task=task, train=(split == "train"))
+        self._knn = KNNGraph(k=knn_k, loop=False, force_undirected=True)
+        self._edge_cache: dict[int, torch.Tensor] = {}
         n = len(self._raw)
         self._indices: list[int] = (
             list(indices) if indices is not None else list(range(n))
@@ -129,9 +127,22 @@ class AirfRANSDataset:
         return len(self._indices)
 
     def __getitem__(self, pos: int) -> Data:
-        raw: Data = self._raw[self._indices[self._order[pos]]]  # type: ignore[assignment]
-        # AirfRANS always supplies x (5 features), pos (2 coords), y (4 targets),
-        # surf (bool mask), and edge_index (added by pre_transform).
+        raw_idx = self._indices[self._order[pos]]
+        raw: Data = self._raw[raw_idx]  # type: ignore[assignment]
+
+        # Build KNN on first access; subsequent calls hit the RAM cache.
+        if raw_idx not in self._edge_cache:
+            # KNNGraph only needs pos — feed a minimal Data to avoid copying
+            # the full feature/target tensors through the transform.
+            pos_data = Data(
+                pos=cast(torch.Tensor, raw.pos),
+                num_nodes=raw.num_nodes,
+            )
+            self._edge_cache[raw_idx] = cast(
+                torch.Tensor, self._knn(pos_data).edge_index
+            ).long()
+        edge_index = self._edge_cache[raw_idx]
+
         x_feat = cast(torch.Tensor, raw.x).float()
         pos_   = cast(torch.Tensor, raw.pos).float()
         x_aug  = torch.cat([pos_, x_feat], dim=-1)   # (N, 7)
@@ -147,7 +158,7 @@ class AirfRANSDataset:
             y     = (y     - y_mean) / y_std
         return Data(
             x=x_aug,
-            edge_index=cast(torch.Tensor, raw.edge_index).long(),
+            edge_index=edge_index,
             y=y,
             surf=surf,
             num_nodes=x_aug.shape[0],
