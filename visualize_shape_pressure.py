@@ -47,7 +47,9 @@ import matplotlib.gridspec as gridspec
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
-from mpl_toolkits.mplot3d import Axes3D  # noqa: F401 — registers 3-D projection in mpl < 3.4
+from mpl_toolkits.mplot3d import (
+    Axes3D,
+)  # noqa: F401 — registers 3-D projection in mpl < 3.4
 from scipy.interpolate import griddata
 from scipy.stats import pearsonr
 from torch_geometric.data import Data
@@ -65,7 +67,7 @@ from run import (
 
 # ── Shape metric constants ─────────────────────────────────────────────────────
 
-N_CHORD: int = 128   # chord-wise interpolation points for thickness/camber vectors
+N_CHORD: int = 128  # chord-wise interpolation points for thickness/camber vectors
 
 
 # ── Shape metric ──────────────────────────────────────────────────────────────
@@ -113,10 +115,10 @@ def compute_shape_vector(surf_pos: np.ndarray) -> np.ndarray:
     sl = np.argsort(x_n[lower])
     y_lo = np.interp(x_grid, x_n[lower][sl], y[lower][sl])
 
-    thickness = y_up - y_lo          # ≥ 0 for a physically valid airfoil
-    camber    = (y_up + y_lo) / 2.0  # signed camber above/below chord
+    thickness = y_up - y_lo  # ≥ 0 for a physically valid airfoil
+    camber = (y_up + y_lo) / 2.0  # signed camber above/below chord
 
-    return np.concatenate([thickness, camber])   # (2 * N_CHORD,)
+    return np.concatenate([thickness, camber])  # (2 * N_CHORD,)
 
 
 def collect_shape_vectors(
@@ -146,7 +148,7 @@ def collect_shape_vectors(
         )
         vecs.append(compute_shape_vector(pos[surf_mask]))
 
-    return np.stack(vecs)   # (A, 2 * N_CHORD)
+    return np.stack(vecs)  # (A, 2 * N_CHORD)
 
 
 # ── Architecture inference ─────────────────────────────────────────────────────
@@ -164,10 +166,10 @@ def infer_model_dims(state_dict: dict) -> dict:
     """
     sd = state_dict
     in_channels = int(sd["encoder.convs.0.weight"].shape[1])
-    hidden_dim  = int(sd["encoder.convs.6.weight"].shape[1])
-    embed_dim   = int(sd["encoder.convs.6.weight"].shape[0])
+    hidden_dim = int(sd["encoder.convs.6.weight"].shape[1])
+    embed_dim = int(sd["encoder.convs.6.weight"].shape[0])
     n_intervals = int(sd["dqe.interval_center"].shape[0])
-    n_protos    = int(sd["dqe.protos_tan"].shape[0])
+    n_protos = int(sd["dqe.protos_tan"].shape[0])
     return dict(
         in_channels=in_channels,
         hidden_dim=hidden_dim,
@@ -195,17 +197,17 @@ def main(args: argparse.Namespace) -> None:
 
     # Apply near-field domain bounds before any dataset construction.
     NEAR_FIELD_BOUNDS["y_min"] = -args.near_field_y
-    NEAR_FIELD_BOUNDS["y_max"] =  args.near_field_y
+    NEAR_FIELD_BOUNDS["y_max"] = args.near_field_y
 
     # ── Raw data ──────────────────────────────────────────────────────────
     print(f"Loading AirfRANS (task={args.task}) …")
     raw_train = AirfRANS(root=args.data_root, task=args.task, train=True)
-    raw_test  = AirfRANS(root=args.data_root, task=args.task, train=False)
+    raw_test = AirfRANS(root=args.data_root, task=args.task, train=False)
 
-    n_total   = len(raw_train)
-    val_size  = max(1, int(n_total * 0.1))
+    n_total = len(raw_train)
+    val_size = max(1, int(n_total * 0.1))
     train_idx = list(range(n_total - val_size))
-    val_idx   = list(range(n_total - val_size, n_total))
+    val_idx = list(range(n_total - val_size, n_total))
 
     # ── Normalisation (must match training) ───────────────────────────────
     print("  Computing normalisation stats …")
@@ -215,22 +217,33 @@ def main(args: argparse.Namespace) -> None:
     # ── Datasets — sequential order (no shuffle) ──────────────────────────
     shared_cache: dict[int, GraphGrid] = {}
     train_ds = AirfRANSNearFieldDataset(
-        args.data_root, "train", task=args.task,
-        norm_stats=norm_stats, indices=train_idx,
-        _shared_raw=raw_train, _shared_cache=shared_cache,
+        args.data_root,
+        "train",
+        task=args.task,
+        norm_stats=norm_stats,
+        indices=train_idx,
+        _shared_raw=raw_train,
+        _shared_cache=shared_cache,
     )
     val_ds = AirfRANSNearFieldDataset(
-        args.data_root, "train", task=args.task,
-        norm_stats=norm_stats, indices=val_idx,
-        _shared_raw=raw_train, _shared_cache=shared_cache,
+        args.data_root,
+        "train",
+        task=args.task,
+        norm_stats=norm_stats,
+        indices=val_idx,
+        _shared_raw=raw_train,
+        _shared_cache=shared_cache,
     )
     test_ds = AirfRANSNearFieldDataset(
-        args.data_root, "test", task=args.task,
-        norm_stats=norm_stats, _shared_raw=raw_test,
+        args.data_root,
+        "test",
+        task=args.task,
+        norm_stats=norm_stats,
+        _shared_raw=raw_test,
     )
     n_train = len(train_ds)
-    n_val   = len(val_ds)
-    n_test  = len(test_ds)
+    n_val = len(val_ds)
+    n_test = len(test_ds)
     print(f"  {n_train} train / {n_val} val / {n_test} test")
 
     # ── Model ─────────────────────────────────────────────────────────────
@@ -243,17 +256,17 @@ def main(args: argparse.Namespace) -> None:
     print("  Collecting pressure interval histograms …")
     with torch.no_grad():
         embs_tr, pv_tr = collect_airfoil_embeddings(model, train_ds, device)
-        embs_va, pv_va = collect_airfoil_embeddings(model, val_ds,   device)
-        embs_te, pv_te = collect_airfoil_embeddings(model, test_ds,  device)
+        embs_va, pv_va = collect_airfoil_embeddings(model, val_ds, device)
+        embs_te, pv_te = collect_airfoil_embeddings(model, test_ds, device)
 
-    all_embs  = torch.cat([embs_tr, embs_va, embs_te]).numpy().astype(np.float64)
-    all_pvals = torch.cat([pv_tr,   pv_va,   pv_te  ]).numpy()
-    cp        = all_pvals * p_std.item() + p_mean.item()   # de-normalised mean surface Cp
+    all_embs = torch.cat([embs_tr, embs_va, embs_te]).numpy().astype(np.float64)
+    all_pvals = torch.cat([pv_tr, pv_va, pv_te]).numpy()
+    cp = all_pvals * p_std.item() + p_mean.item()  # de-normalised mean surface Cp
 
     # Pressure PCA → 2-D similarity coords
     E_c = all_embs - all_embs.mean(0)
     _, _, Vt_p = np.linalg.svd(E_c, full_matrices=False)
-    p_coords = E_c @ Vt_p[:2].T   # (A, 2)
+    p_coords = E_c @ Vt_p[:2].T  # (A, 2)
 
     # ── Shape vectors ─────────────────────────────────────────────────────
     # collect_shape_vectors iterates each dataset via the same _order that
@@ -261,13 +274,13 @@ def main(args: argparse.Namespace) -> None:
     print("  Computing airfoil shape vectors …")
     shape_tr = collect_shape_vectors(raw_train, train_ds)
     shape_va = collect_shape_vectors(raw_train, val_ds)
-    shape_te = collect_shape_vectors(raw_test,  test_ds)
+    shape_te = collect_shape_vectors(raw_test, test_ds)
     all_shape = np.concatenate([shape_tr, shape_va, shape_te])  # (A, 2*N_CHORD)
 
     # Shape PCA → 2-D shape coords
     S_c = all_shape - all_shape.mean(0)
     _, _, Vt_s = np.linalg.svd(S_c, full_matrices=False)
-    s_coords = S_c @ Vt_s[:2].T   # (A, 2)
+    s_coords = S_c @ Vt_s[:2].T  # (A, 2)
 
     # Pearson r: pressure PC1 vs shape PC1
     r_val, p_val = pearsonr(p_coords[:, 0], s_coords[:, 0])
@@ -277,7 +290,7 @@ def main(args: argparse.Namespace) -> None:
     print("  Rendering figure …")
 
     xp, yp = p_coords[:, 0], p_coords[:, 1]
-    xs, ys  = s_coords[:, 0], s_coords[:, 1]
+    xs, ys = s_coords[:, 0], s_coords[:, 1]
 
     # Interpolated pressure surface for the 3-D panel
     xi = np.linspace(xp.min(), xp.max(), 60)
@@ -290,61 +303,96 @@ def main(args: argparse.Namespace) -> None:
     cp_min, cp_max = cp.min(), cp.max()
 
     fig = plt.figure(figsize=(19, 8))
-    gs  = gridspec.GridSpec(1, 2, width_ratios=[1.45, 1], wspace=0.08,
-                            left=0.04, right=0.97, top=0.93, bottom=0.07)
+    gs = gridspec.GridSpec(
+        1,
+        2,
+        width_ratios=[1.45, 1],
+        wspace=0.08,
+        left=0.04,
+        right=0.97,
+        top=0.93,
+        bottom=0.07,
+    )
 
     # ── Left panel: 3-D pressure surface, points coloured by shape PC1 ────
     ax3 = fig.add_subplot(gs[0], projection="3d")
 
     ax3.plot_surface(
-        Xi, Yi, Zi,
-        cmap="RdBu_r", alpha=0.45,
-        linewidth=0, antialiased=True,
-        vmin=cp_min, vmax=cp_max,
+        Xi,
+        Yi,
+        Zi,
+        cmap="RdBu_r",
+        alpha=0.45,
+        linewidth=0,
+        antialiased=True,
+        vmin=cp_min,
+        vmax=cp_max,
     )
 
     # Scatter: colour = shape PC1 (viridis), size encodes nothing else
     shape_c = s_coords[:, 0]
     sc_shape = ax3.scatter(
-        xp, yp, cp,
-        c=shape_c, cmap="viridis",
-        vmin=shape_c.min(), vmax=shape_c.max(),
-        s=45, depthshade=True,
-        edgecolors="k", linewidths=0.3, zorder=5,
+        xp,
+        yp,
+        cp,
+        c=shape_c,
+        cmap="viridis",
+        vmin=shape_c.min(),
+        vmax=shape_c.max(),
+        s=45,
+        depthshade=True,
+        edgecolors="k",
+        linewidths=0.3,
+        zorder=5,
     )
-    cb_shape = fig.colorbar(sc_shape, ax=ax3, shrink=0.42, pad=0.04,
-                             label="Shape PC 1  (thickness/camber mode)")
+    cb_shape = fig.colorbar(
+        sc_shape,
+        ax=ax3,
+        shrink=0.42,
+        pad=0.04,
+        label="Shape PC 1  (thickness/camber mode)",
+    )
 
     ax3.set_xlabel("Pressure PC 1", labelpad=6)
     ax3.set_ylabel("Pressure PC 2", labelpad=6)
     ax3.set_zlabel("Mean surface Cp", labelpad=6)
     ax3.set_title(
-        "Pressure-similarity surface  ·  point colour = shape\n"
+        "Pressure-similarity colour = shape\n"
         f"Pressure–shape correlation:  r = {r_val:+.3f}",
-        fontsize=10, pad=10,
+        fontsize=10,
+        pad=10,
     )
 
     # ── Right panel: 2-D shape space coloured by mean Cp ──────────────────
     ax2 = fig.add_subplot(gs[1])
 
     sc_cp = ax2.scatter(
-        xs, ys,
-        c=cp, cmap="RdBu_r",
-        vmin=cp_min, vmax=cp_max,
-        s=42, edgecolors="k", linewidths=0.3, alpha=0.88,
+        xs,
+        ys,
+        c=cp,
+        cmap="RdBu_r",
+        vmin=cp_min,
+        vmax=cp_max,
+        s=42,
+        edgecolors="k",
+        linewidths=0.3,
+        alpha=0.88,
     )
     cb_cp = fig.colorbar(sc_cp, ax=ax2, shrink=0.78, label="Mean surface Cp")
 
     ax2.set_xlabel("Shape PC 1  (dominant thickness/camber mode)")
     ax2.set_ylabel("Shape PC 2")
-    ax2.set_title("Shape similarity space  ·  colour = mean surface Cp", fontsize=10)
+    ax2.set_title("Shape similarity", fontsize=10)
     ax2.set_aspect("equal", adjustable="datalim")
     ax2.grid(True, lw=0.4, alpha=0.4)
 
     ax2.annotate(
         f"Pressure–shape\ncorrelation\nr = {r_val:+.3f}",
-        xy=(0.04, 0.96), xycoords="axes fraction",
-        va="top", ha="left", fontsize=9,
+        xy=(0.04, 0.96),
+        xycoords="axes fraction",
+        va="top",
+        ha="left",
+        fontsize=9,
         bbox=dict(boxstyle="round,pad=0.35", fc="white", ec="#999", alpha=0.85),
     )
 
@@ -372,7 +420,9 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--data_root", default="../data/AirfRANS")
     p.add_argument("--task", default="scarce", choices=["scarce", "full"])
     p.add_argument(
-        "--near_field_y", type=float, default=0.6,
+        "--near_field_y",
+        type=float,
+        default=0.6,
         help="Must match the value used during training",
     )
     p.add_argument(
