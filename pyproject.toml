@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "StratifiedEmbedding"
+version = "0.1.0"
+description = "Differentiable Quotient Embeddings in stratified spaces for CFD node regression"
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.2",
+    "torch_geometric>=2.5",
+    "numpy>=1.26",
+    "matplotlib>=3.8",
+    "scikit-learn>=1.4",
+]
+
+[project.optional-dependencies]
+umap = ["umap-learn>=0.5"]
+dev  = ["pyright", "pytest"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["StratifiedEmbedding*"]
+
+[tool.pyright]
+pythonVersion = "3.10"
+venvPath = "."
+reportMissingImports = "none"
