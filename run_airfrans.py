@@ -75,58 +75,83 @@ BASE_IN_DIM = 5  # raw AirfRANS node features (excl. spatial pos)
 
 
 class AirfRANSDataset:
-    """On-disk per-sample cache for memory-efficient loading.
+    """Lazy per-sample loader backed by PyG's own processed cache.
 
-    On first use, processes all raw AirfRANS graphs (KNN edge construction +
-    feature augmentation) and writes individual .pt files under
-    <root>/_cache_knn<k>/<split>/.  Subsequent accesses load graphs one at a
-    time from cache — the full dataset is never in RAM simultaneously.
+    Uses ``pre_transform=KNNGraph`` so edges are built once and stored in
+    ``<root>/airfrans/processed/``.  No secondary cache is created — disk
+    usage equals the PyG processed folder only.
 
-    Normalisation is applied on-the-fly so the cached tensors remain in their
-    original scale and can be reused with different normalisations without
-    re-processing.
+    Feature augmentation (prepend spatial pos to x) and normalisation are
+    applied on-the-fly at load time, so the stored tensors remain in their
+    original scale.
+
+    Parameters
+    ----------
+    task : "scarce" | "full"
+        AirfRANS task split.  "scarce" (~200 simulations) is the default;
+        "full" (~800 training simulations) is available via --task full.
     """
 
     def __init__(
         self,
         root: str,
         split: str,
+        task: str = "scarce",
         knn_k: int = 8,
         norm_stats: tuple[torch.Tensor, torch.Tensor,
                           torch.Tensor, torch.Tensor] | None = None,
         indices: list[int] | None = None,
     ) -> None:
-        self._cache_dir = Path(root) / f"_cache_knn{knn_k}" / split
-        self._build_cache(root, split, knn_k)
-        all_paths = sorted(self._cache_dir.glob("*.pt"))
-        self._paths: list[Path] = (
-            [all_paths[i] for i in indices] if indices is not None else all_paths
+        pre_transform = KNNGraph(k=knn_k, loop=False, force_undirected=True)
+        self._raw = AirfRANS(
+            root=root,
+            task=task,
+            train=(split == "train"),
+            pre_transform=pre_transform,
         )
-        self._order: list[int] = list(range(len(self._paths)))
+        n = len(self._raw)
+        self._indices: list[int] = (
+            list(indices) if indices is not None else list(range(n))
+        )
+        self._order: list[int] = list(range(len(self._indices)))
         self.norm_stats = norm_stats
 
     # ── public API ─────────────────────────────────────────────────────────────
 
     @property
     def in_dim(self) -> int:
-        """Feature dimension — peeked from first cached graph."""
-        data: Data = torch.load(self._paths[0], map_location="cpu")  # type: ignore[assignment]
-        assert data.x is not None
-        return int(data.x.shape[1])
+        """Feature dimension — peeked from first graph (always pos + x = 7)."""
+        x = self[0].x
+        assert x is not None
+        return int(x.shape[1])
 
     def __len__(self) -> int:
-        return len(self._paths)
+        return len(self._indices)
 
     def __getitem__(self, pos: int) -> Data:
-        data: Data = torch.load(
-            self._paths[self._order[pos]], map_location="cpu"
-        )  # type: ignore[assignment]
+        raw: Data = self._raw[self._indices[self._order[pos]]]  # type: ignore[assignment]
+        # AirfRANS always supplies x (5 features), pos (2 coords), y (4 targets),
+        # surf (bool mask), and edge_index (added by pre_transform).
+        x_feat = cast(torch.Tensor, raw.x).float()
+        pos_   = cast(torch.Tensor, raw.pos).float()
+        x_aug  = torch.cat([pos_, x_feat], dim=-1)   # (N, 7)
+        y      = cast(torch.Tensor, raw.y).float()
+        surf   = (
+            cast(torch.Tensor, raw.surf).bool()
+            if hasattr(raw, "surf") and raw.surf is not None
+            else torch.zeros(x_aug.shape[0], dtype=torch.bool)
+        )
         if self.norm_stats is not None:
             x_mean, x_std, y_mean, y_std = self.norm_stats
-            assert data.x is not None and data.y is not None
-            data.x = (data.x - x_mean) / x_std
-            data.y = (cast(torch.Tensor, data.y) - y_mean) / y_std
-        return data
+            x_aug = (x_aug - x_mean) / x_std
+            y     = (y     - y_mean) / y_std
+        return Data(
+            x=x_aug,
+            edge_index=cast(torch.Tensor, raw.edge_index).long(),
+            y=y,
+            surf=surf,
+            num_nodes=x_aug.shape[0],
+        )
 
     def __iter__(self):
         for i in range(len(self)):
@@ -135,54 +160,6 @@ class AirfRANSDataset:
     def shuffle(self) -> None:
         """Randomly permute the iteration order for the next epoch."""
         random.shuffle(self._order)
-
-    # ── cache construction (runs once) ─────────────────────────────────────────
-
-    def _build_cache(self, root: str, split: str, knn_k: int) -> None:
-        """Write per-sample .pt files; skipped if marker file already exists."""
-        marker = self._cache_dir / ".done"
-        if marker.exists():
-            return
-
-        self._cache_dir.mkdir(parents=True, exist_ok=True)
-        print(f"Building '{split}' cache (knn_k={knn_k}) — runs once …")
-        transform = KNNGraph(k=knn_k, loop=False, force_undirected=True)
-        raw = AirfRANS(root=root, task="full", train=(split == "train"),
-                       transform=transform)
-
-        for i, sample in enumerate(raw):
-            x = sample.x.float() if sample.x is not None else sample.pos.float()
-            pos = (
-                sample.pos.float()
-                if sample.pos is not None
-                else torch.zeros(x.shape[0], 2)
-            )
-            x_aug = torch.cat([pos, x], dim=-1)   # (N, 7)
-            y = (
-                sample.y.float()
-                if sample.y is not None
-                else torch.zeros(x_aug.shape[0], N_TARGETS)
-            )
-            surf = (
-                sample.surf.bool()
-                if hasattr(sample, "surf") and sample.surf is not None
-                else torch.zeros(x_aug.shape[0], dtype=torch.bool)
-            )
-            torch.save(
-                Data(
-                    x=x_aug,
-                    edge_index=sample.edge_index.long(),
-                    y=y,
-                    surf=surf,
-                    num_nodes=x_aug.shape[0],
-                ),
-                self._cache_dir / f"{i:04d}.pt",
-            )
-            if (i + 1) % 100 == 0 or (i + 1) == len(raw):
-                print(f"  cached {i + 1}/{len(raw)}")
-
-        marker.touch()
-        print("  Cache ready.")
 
 
 def make_neighbor_loader(
@@ -396,8 +373,10 @@ def train(args: argparse.Namespace) -> None:
     print(f"Device: {device}")
 
     # ── Load data (lazy — one graph at a time, never all in RAM) ─────────────
-    print("Building / loading data cache …")
-    train_raw = AirfRANSDataset(args.data_root, "train", knn_k=args.knn_k)
+    print(f"Loading AirfRANS (task={args.task}) …")
+    train_raw = AirfRANSDataset(
+        args.data_root, "train", task=args.task, knn_k=args.knn_k
+    )
     n_total   = len(train_raw)
     val_size  = max(1, int(n_total * 0.1))
     train_indices: list[int] = list(range(n_total - val_size))
@@ -406,21 +385,22 @@ def train(args: argparse.Namespace) -> None:
     print("  Computing normalisation stats (streaming) …")
     norm_stats = compute_normalisation_streaming(
         AirfRANSDataset(
-            args.data_root, "train", knn_k=args.knn_k, indices=train_indices
+            args.data_root, "train", task=args.task,
+            knn_k=args.knn_k, indices=train_indices,
         )
     )
     _, _, y_mean, y_std = norm_stats
 
     train_dataset = AirfRANSDataset(
-        args.data_root, "train",
+        args.data_root, "train", task=args.task,
         knn_k=args.knn_k, norm_stats=norm_stats, indices=train_indices,
     )
     val_dataset = AirfRANSDataset(
-        args.data_root, "train",
+        args.data_root, "train", task=args.task,
         knn_k=args.knn_k, norm_stats=norm_stats, indices=val_indices,
     )
     test_dataset = AirfRANSDataset(
-        args.data_root, "test",
+        args.data_root, "test", task=args.task,
         knn_k=args.knn_k, norm_stats=norm_stats,
     )
 
@@ -752,6 +732,15 @@ def _parse_args() -> argparse.Namespace:
     # Data
     p.add_argument(
         "--data_root", default="../data/AirfRANS", help="AirfRANS download dir"
+    )
+    p.add_argument(
+        "--task",
+        default="scarce",
+        choices=["scarce", "full"],
+        help=(
+            "AirfRANS task variant.  'scarce' (~200 train sims, fits easily in memory) "
+            "is the default.  'full' (~800 train sims) needs more disk and RAM."
+        ),
     )
     p.add_argument("--knn_k", type=int, default=8, help="KNN graph edges per node")
     p.add_argument(
