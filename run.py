@@ -452,14 +452,10 @@ def evaluate_pressure(
     model: PressureDQEModel,
     dataset: AirfRANSNearFieldDataset,
     device: torch.device,
-    p_mean: torch.Tensor,
-    p_std: torch.Tensor,
     surf_weight: float = 10.0,
 ) -> dict[str, float]:
     """Surface-weighted MSE and R² for pressure, evaluated at node resolution."""
     model.eval()
-    p_mean_cpu = p_mean.cpu()
-    p_std_cpu = p_std.cpu()
 
     surf_se = vol_se = 0.0
     surf_n = vol_n = 0
@@ -476,18 +472,17 @@ def evaluate_pressure(
         del patches_d, pred_patch
 
         pred_n = _reconstruct_node_predictions(pred_patch_cpu, gg.positions, node_grid_rc)
-        pred_dn = pred_n * p_std_cpu + p_mean_cpu
-        true_dn = p_norm_node * p_std_cpu + p_mean_cpu
 
-        se = (pred_dn - true_dn) ** 2
+        # Use normalised values throughout — avoids p_std amplification blowing up MSE
+        se = (pred_n - p_norm_node) ** 2
         surf_se += se[smask].sum().item()
         vol_se += se[~smask].sum().item()
         surf_n += int(smask.sum())
         vol_n += int((~smask).sum())
         res_sq += se.sum().item()
-        true_sum += true_dn.sum().item()
-        true_sq += (true_dn ** 2).sum().item()
-        total_n += true_dn.shape[0]
+        true_sum += p_norm_node.sum().item()
+        true_sq += (p_norm_node ** 2).sum().item()
+        total_n += p_norm_node.shape[0]
 
     mse_w = (
         surf_se / max(surf_n, 1) * surf_weight + vol_se / max(vol_n, 1)
@@ -774,8 +769,10 @@ def train(args: argparse.Namespace) -> None:
             )
             l_reg = (w * per_patch).sum() / w.sum()
 
-            # Centripetal: pull each patch embedding toward its expected DQE prototype
-            expected_proto = pr_w @ model.dqe.protos_tan  # (P, d)
+            # Centripetal: pull each patch embedding toward its expected DQE prototype.
+            # Detach pr_w to break the double-gradient path through protos_tan — the
+            # assignment weights act as a fixed target here, not a learnable gate.
+            expected_proto = pr_w.detach() @ model.dqe.protos_tan  # (P, d)
             l_cent = F.mse_loss(emb, expected_proto)
 
             # Spread: repel prototypes from each other so they can't collapse to the mean.
@@ -807,9 +804,7 @@ def train(args: argparse.Namespace) -> None:
 
         if (epoch + 1) % max(1, args.full_epochs // 10) == 0:
             torch.cuda.empty_cache()
-            val_m = evaluate_pressure(
-                model, val_ds, device, p_mean_d, p_std_d, args.surf_weight
-            )
+            val_m = evaluate_pressure(model, val_ds, device, args.surf_weight)
             kappa = model.dqe.kappa.item()
             print(
                 f"  [full] epoch {epoch + 1:3d}  "
@@ -839,9 +834,7 @@ def train(args: argparse.Namespace) -> None:
     model.load_state_dict(ckpt["model"])
     torch.cuda.empty_cache()
 
-    test_m = evaluate_pressure(
-        model, test_ds, device, p_mean_d, p_std_d, args.surf_weight
-    )
+    test_m = evaluate_pressure(model, test_ds, device, args.surf_weight)
     for k, v in test_m.items():
         print(f"  {k}: {v:.4f}")
 
