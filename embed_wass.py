@@ -74,7 +74,8 @@ from torch_geometric.data import Data
 # ── Shared data pipeline ───────────────────────────────────────────────────────
 from run import (
     NEAR_FIELD_BOUNDS,
-    GRID_H, GRID_W,
+    GRID_H,
+    GRID_W,
     N_PATCHES,
     GraphGrid,
     AirfRANSNearFieldDataset,
@@ -95,36 +96,125 @@ from run_airfrans import (
 from StratifiedEmbedding import WarmupRegressor
 
 
-# ── Riemannian distance ────────────────────────────────────────────────────────
+# ── κ-stereographic (Poincaré ball / sphere) geometry ─────────────────────────
+#
+# Reference: Bachmann et al., "Constant Curvature Graph Convolutional Networks"
+# (ICML 2020).  The κ-stereographic model unifies hyperbolic (κ < 0) and
+# spherical (κ > 0) geometry with a single set of formulas.
+#
+# Möbius addition (κ-stereographic):
+#   x ⊕_κ y = ((1 + 2κ⟨x,y⟩ + κ‖y‖²)x + (1 − κ‖x‖²)y)
+#              / (1 + 2κ⟨x,y⟩ + κ²‖x‖²‖y‖²)
+#
+# Geodesic distance:
+#   d_κ(x, y) = (2/√|κ|) · arctan_κ(√|κ| · ‖(−x) ⊕_κ y‖)
+#   where arctan_κ = arctanh for κ < 0, arctan for κ > 0.
+#
+# Exponential map at origin (tangent → manifold):
+#   expmap₀(v) = tanh(√|κ| ‖v‖) / (√|κ| ‖v‖) · v        (hyperbolic)
+#              = tan(√κ ‖v‖)    / (√κ   ‖v‖) · v        (spherical)
+#
+# All three formulas use a smooth sigmoid blend over κ so that gradients
+# flow through κ everywhere, including near κ = 0.
 
 
-def geodesic_dist(
-    x:     torch.Tensor,
-    y:     torch.Tensor,
+def _sqrt_k(kappa: torch.Tensor) -> torch.Tensor:
+    """√|κ| with ε-smoothing to avoid NaN gradients at κ = 0.
+
+    PyTorch's autograd computes d/dx[sqrt(x)] = 1/(2*sqrt(x)), which is inf
+    at x = 0.  Adding ε inside the sqrt keeps the gradient finite.
+    """
+    return (kappa.abs() + 1e-12).sqrt()
+
+
+def _smooth_gate(kappa: torch.Tensor) -> torch.Tensor:
+    """Sigmoid gate: ≈ 0 for κ ≪ 0 (hyperbolic), ≈ 1 for κ ≫ 0 (spherical).
+
+    Temperature T = 1000 makes the transition sharp (width ~ 1/T = 0.001 in
+    κ-space) while keeping a non-zero gradient through κ everywhere.
+    """
+    return torch.sigmoid(kappa * 1000.0)
+
+
+def mobius_add(
+    x: torch.Tensor,
+    y: torch.Tensor,
     kappa: torch.Tensor,
 ) -> torch.Tensor:
-    """Geodesic distance for constant curvature κ (tangent-space model).
-
-    Embeddings are stored as vectors in R^d; κ modifies only the distance
-    formula.  For small |κ|, all three branches agree to first order.
+    """Möbius addition x ⊕_κ y in the κ-stereographic model.
 
     Parameters
     ----------
-    x, y  : (..., d)
+    x, y  : (..., d) — points on the manifold
+    kappa : scalar
+
+    Returns (..., d)
+    """
+    xy = (x * y).sum(dim=-1, keepdim=True)       # ⟨x, y⟩
+    x2 = (x * x).sum(dim=-1, keepdim=True)       # ‖x‖²
+    y2 = (y * y).sum(dim=-1, keepdim=True)       # ‖y‖²
+
+    num   = (1.0 + 2.0 * kappa * xy + kappa * y2) * x + (1.0 - kappa * x2) * y
+    denom = 1.0 + 2.0 * kappa * xy + kappa ** 2 * x2 * y2
+    return num / denom.clamp(min=1e-8)
+
+
+def expmap0(v: torch.Tensor, kappa: torch.Tensor) -> torch.Tensor:
+    """Exponential map at origin: tangent vector → manifold point.
+
+    For κ < 0 (hyperbolic):  x = tanh(√|κ| ‖v‖) / (√|κ| ‖v‖) · v
+    For κ > 0 (spherical):   x = tan(√κ ‖v‖)    / (√κ   ‖v‖) · v
+
+    Both branches collapse to the identity for |κ| → 0.
+
+    Parameters
+    ----------
+    v     : (..., d) — tangent vector at origin
+    kappa : scalar
+    """
+    v_norm = torch.norm(v, dim=-1, keepdim=True).clamp(min=1e-8)
+    sk     = _sqrt_k(kappa)
+
+    # Hyperbolic branch: scale ∈ (0, 1/√|κ|)  —  maps into the open ball
+    hyp_arg   = (sk * v_norm).clamp(max=1.0 - 1e-6)
+    hyp_scale = torch.tanh(hyp_arg) / (sk * v_norm)
+
+    # Spherical branch: clamp arg below π/2 to avoid tan divergence
+    sph_arg   = (sk * v_norm).clamp(max=math.pi / 2.0 - 1e-3)
+    sph_scale = torch.tan(sph_arg) / (sk * v_norm)
+
+    s = _smooth_gate(kappa)
+    return v * ((1.0 - s) * hyp_scale + s * sph_scale)
+
+
+def geodesic_dist(
+    x: torch.Tensor,
+    y: torch.Tensor,
+    kappa: torch.Tensor,
+) -> torch.Tensor:
+    """True geodesic distance via Möbius addition.
+
+    d_κ(x, y) = (2/√|κ|) · arctan_κ(√|κ| · ‖(−x) ⊕_κ y‖)
+
+    Uses a smooth sigmoid blend over κ so gradients flow through κ everywhere.
+
+    Parameters
+    ----------
+    x, y  : (..., d) — manifold points produced by expmap0
     kappa : scalar — learnable curvature
     Returns (...,) non-negative distances.
     """
-    chord = torch.norm(x - y, dim=-1).clamp(min=1e-8)
+    diff      = mobius_add(-x, y, kappa)
+    diff_norm = torch.norm(diff, dim=-1).clamp(min=1e-8)
 
-    abs_k  = kappa.abs()
-    sqrt_k = abs_k.sqrt().clamp(min=1e-8)
-    # scaled half-chord; clamp keeps arctanh/arctan arguments safe
-    arg = (sqrt_k * chord * 0.5).clamp(max=1.0 - 1e-6)
+    sk  = _sqrt_k(kappa)
+    arg = (sk * diff_norm).clamp(max=1.0 - 1e-6)
 
-    hyp = (2.0 / sqrt_k) * torch.arctanh(arg)   # κ < 0
-    sph = (2.0 / sqrt_k) * torch.arctan(arg)     # κ > 0
+    hyp = (2.0 / sk) * torch.arctanh(arg)   # κ < 0 branch
+    sph = (2.0 / sk) * torch.arctan(arg)    # κ > 0 branch
 
-    return torch.where(kappa < -1e-5, hyp, torch.where(kappa > 1e-5, sph, chord))
+    s = _smooth_gate(kappa)
+    return (1.0 - s) * hyp + s * sph
 
 
 # ── Model ──────────────────────────────────────────────────────────────────────
@@ -145,31 +235,45 @@ class WassersteinEmbedder(nn.Module):
 
     def __init__(
         self,
-        embed_dim:     int   = 64,
-        base_channels: int   = _BASE_CH,
-        dropout:       float = 0.1,
-        K_max:         float = 2.0,
+        embed_dim: int = 64,
+        base_channels: int = _BASE_CH,
+        dropout: float = 0.1,
+        K_max: float = 2.0,
     ) -> None:
         super().__init__()
-        self.encoder     = ShapeEncoder(embed_dim, base_channels, dropout)
+        self.encoder = ShapeEncoder(embed_dim, base_channels, dropout)
         self.warmup_head = WarmupRegressor(embed_dim, n_targets=1)
-        self._log_kappa  = nn.Parameter(torch.zeros(1))
-        self._K_max      = K_max
+        self._log_kappa = nn.Parameter(torch.ones(1) * 0.5)  # starts hyperbolic (κ < 0)
+        self._K_max = K_max
 
     @property
     def kappa(self) -> torch.Tensor:
         """Learnable curvature κ ∈ (−K_max, K_max)."""
         return torch.tanh(self._log_kappa) * self._K_max
 
-    def embed(self, patches: torch.Tensor) -> torch.Tensor:
-        """(P, 7, H, W) → (1, embed_dim) — mean-pooled airfoil embedding."""
+    def _encode(self, patches: torch.Tensor) -> torch.Tensor:
+        """(P, 7, H, W) → (1, d) tangent vector at origin (Euclidean R^d)."""
         return self.encoder(patches).mean(0, keepdim=True)
 
+    def embed(self, patches: torch.Tensor) -> torch.Tensor:
+        """(P, 7, H, W) → (1, d) manifold point via expmap₀.
+
+        The encoder output is treated as a tangent vector at the origin and
+        mapped onto the κ-stereographic manifold.  For κ < 0 this constrains
+        the embedding inside the Poincaré ball of radius 1/√|κ|.
+        """
+        return expmap0(self._encode(patches), self.kappa)
+
     def warmup_forward(self, patches: torch.Tensor) -> torch.Tensor:
-        return self.warmup_head(self.embed(patches))   # (1, 1) Cp prediction
+        """Phase-1 warmup: tangent-space embedding → Cp prediction.
+
+        Deliberately uses _encode (not embed) so the warmup head operates in
+        flat Euclidean space, independent of the current κ.
+        """
+        return self.warmup_head(self._encode(patches))  # (1, 1)
 
     def pairwise_geodesic(self, E: torch.Tensor) -> torch.Tensor:
-        """(A, d) → (A, A) pairwise geodesic distance matrix."""
+        """(A, d) manifold points → (A, A) pairwise geodesic distance matrix."""
         return geodesic_dist(
             E.unsqueeze(1),   # (A, 1, d)
             E.unsqueeze(0),   # (1, A, d)
@@ -180,10 +284,13 @@ class WassersteinEmbedder(nn.Module):
         for p in self.parameters():
             p.requires_grad_(False)
         if phase == 1:
-            for p in self.encoder.parameters():     p.requires_grad_(True)
-            for p in self.warmup_head.parameters(): p.requires_grad_(True)
+            for p in self.encoder.parameters():
+                p.requires_grad_(True)
+            for p in self.warmup_head.parameters():
+                p.requires_grad_(True)
         elif phase == 2:
-            for p in self.encoder.parameters():     p.requires_grad_(True)
+            for p in self.encoder.parameters():
+                p.requires_grad_(True)
             self._log_kappa.requires_grad_(True)
 
 
@@ -193,9 +300,14 @@ class WassersteinEmbedder(nn.Module):
 def build_wasserstein_matrix(profiles: np.ndarray) -> np.ndarray:
     """Pairwise W₁ between chord-wise Cp profiles.
 
-    Discrete 1-D Wasserstein treating each profile as a uniform empirical
-    measure over its N_CHORD values:
-      W₁(p, q) = (1/N) ∑ |sort(p) - sort(q)|
+    Chord-wise L1 distance between Cp profiles:
+      d(p, q) = (1/N) ∑ₜ |p(xₜ) − q(xₜ)|
+
+    Treats each profile as a function on the chord axis [0, 1] sampled at
+    N_CHORD equally-spaced stations and integrates the pointwise absolute
+    difference.  This preserves the spatial loading distribution — a
+    front-loaded and rear-loaded profile with the same Cp value range are
+    correctly measured as distant.
 
     Fully vectorised: O(A²·N) time, O(A²·N) peak memory.
 
@@ -207,19 +319,18 @@ def build_wasserstein_matrix(profiles: np.ndarray) -> np.ndarray:
     -------
     W : (A, A) symmetric non-negative matrix
     """
-    ps   = np.sort(profiles, axis=1)                          # (A, N)
-    diff = ps[:, np.newaxis, :] - ps[np.newaxis, :, :]        # (A, A, N)
-    return np.abs(diff).mean(axis=2).astype(np.float32)       # (A, A)
+    diff = profiles[:, np.newaxis, :] - profiles[np.newaxis, :, :]  # (A, A, N)
+    return np.abs(diff).mean(axis=2).astype(np.float32)              # (A, A)
 
 
 # ── Data helpers ───────────────────────────────────────────────────────────────
 
 
 def collect_cp_profiles_ordered(
-    raw_ds:  AirfRANS,
+    raw_ds: AirfRANS,
     dataset: AirfRANSNearFieldDataset,
-    p_mean:  float,
-    p_std:   float,
+    p_mean: float,
+    p_std: float,
 ) -> np.ndarray:
     """(A, N_CHORD) chord-wise Cp profiles in current dataset iteration order.
 
@@ -227,24 +338,26 @@ def collect_cp_profiles_ordered(
     ``run.py``'s constants directly via ``raw.y[:, 2]`` (pressure is target
     column 2 in AirfRANS).
     """
-    P_IDX_LOCAL = 2   # pressure column in raw.y
+    P_IDX_LOCAL = 2  # pressure column in raw.y
     profiles: list[np.ndarray] = []
     for i in range(len(dataset)):
         raw_idx = dataset._indices[dataset._order[i]]
         raw: Data = raw_ds[raw_idx]  # type: ignore[assignment]
-        pos  = cast(torch.Tensor, raw.pos).float().numpy()
+        pos = cast(torch.Tensor, raw.pos).float().numpy()
         surf = (
             cast(torch.Tensor, raw.surf).bool().numpy()
             if hasattr(raw, "surf") and raw.surf is not None
             else np.zeros(pos.shape[0], dtype=bool)
         )
-        p_norm = (cast(torch.Tensor, raw.y).float().numpy()[:, P_IDX_LOCAL] - p_mean) / p_std
+        p_norm = (
+            cast(torch.Tensor, raw.y).float().numpy()[:, P_IDX_LOCAL] - p_mean
+        ) / p_std
         profiles.append(compute_cp_profile(pos[surf], p_norm[surf]))
     return np.stack(profiles)
 
 
 def collect_aoas(
-    raw_ds:   AirfRANS,
+    raw_ds: AirfRANS,
     datasets: list[AirfRANSNearFieldDataset],
 ) -> np.ndarray:
     """(A,) angle of attack (degrees) for all airfoils, in iteration order."""
@@ -261,9 +374,9 @@ def collect_aoas(
 
 @torch.no_grad()
 def collect_embeddings(
-    model:    WassersteinEmbedder,
+    model: WassersteinEmbedder,
     datasets: list[AirfRANSNearFieldDataset],
-    device:   torch.device,
+    device: torch.device,
 ) -> tuple[torch.Tensor, np.ndarray]:
     """(A, d) embeddings and (A,) mean-Cp for all airfoils."""
     model.eval()
@@ -280,7 +393,7 @@ def collect_embeddings(
 
 def spread_loss(E: torch.Tensor, margin: float) -> torch.Tensor:
     """Push embeddings apart: hinge on pairs closer than `margin`."""
-    D   = torch.cdist(E, E)
+    D = torch.cdist(E, E)
     off = ~torch.eye(E.shape[0], dtype=torch.bool, device=E.device)
     return F.relu(margin - D[off]).mean()
 
@@ -289,35 +402,41 @@ def spread_loss(E: torch.Tensor, margin: float) -> torch.Tensor:
 
 
 def plot_embedding_scatter(
-    embeddings: np.ndarray,   # (A, d)
-    cps:        np.ndarray,   # (A,)  normalised
-    all_shape:  np.ndarray,   # (A, 2*N_CHORD) geometric shape vectors
-    aoas:       np.ndarray,   # (A,) degrees
-    p_mean:     float,
-    p_std:      float,
-    out_path:   Path,
+    embeddings: np.ndarray,  # (A, d)
+    cps: np.ndarray,  # (A,)  normalised
+    all_shape: np.ndarray,  # (A, 2*N_CHORD) geometric shape vectors
+    aoas: np.ndarray,  # (A,) degrees
+    p_mean: float,
+    p_std: float,
+    out_path: Path,
 ) -> None:
     """PCA of embeddings coloured by mean Cp, AoA, and geometric shape PC1."""
     E_c = embeddings - embeddings.mean(0)
     _, _, Vt = np.linalg.svd(E_c, full_matrices=False)
-    coords = E_c @ Vt[:2].T                           # (A, 2)
+    coords = E_c @ Vt[:2].T  # (A, 2)
 
     S_c = all_shape - all_shape.mean(0)
     _, _, Vt_s = np.linalg.svd(S_c, full_matrices=False)
-    shape_pc1 = S_c @ Vt_s[0]                         # (A,)
+    shape_pc1 = S_c @ Vt_s[0]  # (A,)
 
     cp_phys = cps * p_std + p_mean
 
     fig, axes = plt.subplots(1, 3, figsize=(18, 5))
     triplets = [
-        (cp_phys,  "Mean surface Cp",          "RdBu_r"),
-        (aoas,     "Angle of Attack (°)",       "coolwarm"),
-        (shape_pc1,"Geometric shape PC 1",      "viridis"),
+        (cp_phys, "Mean surface Cp", "RdBu_r"),
+        (aoas, "Angle of Attack (°)", "coolwarm"),
+        (shape_pc1, "Geometric shape PC 1", "viridis"),
     ]
     for ax, (vals, label, cmap) in zip(axes, triplets):
         sc = ax.scatter(
-            coords[:, 0], coords[:, 1],
-            c=vals, cmap=cmap, s=45, edgecolors="k", linewidths=0.3, alpha=0.88,
+            coords[:, 0],
+            coords[:, 1],
+            c=vals,
+            cmap=cmap,
+            s=45,
+            edgecolors="k",
+            linewidths=0.3,
+            alpha=0.88,
         )
         fig.colorbar(sc, ax=ax, label=label, fraction=0.046, pad=0.04)
         ax.set_xlabel("Embedding PC 1")
@@ -327,8 +446,11 @@ def plot_embedding_scatter(
         r, _ = pearsonr(coords[:, 0], vals)
         ax.annotate(
             f"r(PC1) = {r:+.3f}",
-            xy=(0.04, 0.96), xycoords="axes fraction",
-            va="top", ha="left", fontsize=9,
+            xy=(0.04, 0.96),
+            xycoords="axes fraction",
+            va="top",
+            ha="left",
+            fontsize=9,
             bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="#999", alpha=0.85),
         )
 
@@ -339,18 +461,18 @@ def plot_embedding_scatter(
 
 
 def plot_distance_correlation(
-    D_geo:    np.ndarray,   # (A, A) geodesic
-    W_target: np.ndarray,   # (A, A) normalised W₁
+    D_geo: np.ndarray,  # (A, A) geodesic
+    W_target: np.ndarray,  # (A, A) normalised W₁
     out_path: Path,
 ) -> None:
     """Scatter of geodesic distance vs W₁ target for all unique pairs."""
-    A   = D_geo.shape[0]
+    A = D_geo.shape[0]
     idx = np.tril_indices(A, k=-1)
     d_v = D_geo[idx]
     w_v = W_target[idx]
 
-    r_p, _ = pearsonr(d_v, w_v)
-    r_s, _ = spearmanr(d_v, w_v)
+    r_p = float(pearsonr(d_v, w_v)[0])   # type: ignore[arg-type]
+    r_s = float(spearmanr(d_v, w_v)[0])  # type: ignore[arg-type]
 
     # Hex-bin density for the (potentially large) number of pairs
     fig, ax = plt.subplots(figsize=(6, 6))
@@ -365,8 +487,11 @@ def plot_distance_correlation(
     ax.set_title("Embedding vs Wasserstein target")
     ax.annotate(
         f"Pearson r  = {r_p:.3f}\nSpearman ρ = {r_s:.3f}",
-        xy=(0.04, 0.96), xycoords="axes fraction",
-        va="top", ha="left", fontsize=10,
+        xy=(0.04, 0.96),
+        xycoords="axes fraction",
+        va="top",
+        ha="left",
+        fontsize=10,
         bbox=dict(boxstyle="round,pad=0.4", fc="white", ec="#999", alpha=0.9),
     )
     ax.legend(fontsize=9)
@@ -382,12 +507,24 @@ def plot_kappa_evolution(kappa_hist: list[float], out_path: Path) -> None:
     fig, ax = plt.subplots(figsize=(8, 3))
     ax.plot(kappa_hist, lw=2, color="steelblue")
     ax.axhline(0.0, color="k", lw=0.8, ls="--", alpha=0.6, label="κ=0  (Euclidean)")
-    ax.fill_between(range(len(kappa_hist)), kappa_hist, 0,
-                    where=[k < 0 for k in kappa_hist],
-                    color="royalblue", alpha=0.15, label="hyperbolic")
-    ax.fill_between(range(len(kappa_hist)), kappa_hist, 0,
-                    where=[k > 0 for k in kappa_hist],
-                    color="tomato", alpha=0.15, label="spherical")
+    ax.fill_between(
+        range(len(kappa_hist)),
+        kappa_hist,
+        0,
+        where=[k < 0 for k in kappa_hist],
+        color="royalblue",
+        alpha=0.15,
+        label="hyperbolic",
+    )
+    ax.fill_between(
+        range(len(kappa_hist)),
+        kappa_hist,
+        0,
+        where=[k > 0 for k in kappa_hist],
+        color="tomato",
+        alpha=0.15,
+        label="spherical",
+    )
     ax.set_xlabel("Epoch (phase 2)")
     ax.set_ylabel("κ")
     ax.set_title("Curvature evolution")
@@ -428,22 +565,22 @@ def train(args: argparse.Namespace) -> None:
     print(f"Device: {device}")
 
     NEAR_FIELD_BOUNDS["y_min"] = -args.near_field_y
-    NEAR_FIELD_BOUNDS["y_max"] =  args.near_field_y
+    NEAR_FIELD_BOUNDS["y_max"] = args.near_field_y
 
     # ── Data ──────────────────────────────────────────────────────────────────
     print(f"Loading AirfRANS (task={args.task}) …")
     raw_train = AirfRANS(root=args.data_root, task=args.task, train=True)
-    raw_test  = AirfRANS(root=args.data_root, task=args.task, train=False)
+    raw_test = AirfRANS(root=args.data_root, task=args.task, train=False)
 
     # Optional flow-condition filter (same logic as run_airfrans.py)
     re_filter = args.reynolds if args.reynolds > 0 else None
-    ma_filter = args.mach     if args.mach     > 0 else None
+    ma_filter = args.mach if args.mach > 0 else None
     if re_filter is not None or ma_filter is not None:
         fparts: list[str] = []
         if re_filter is not None:
-            fparts.append(f"Re={re_filter:.3e} ±{args.reynolds_tol*100:.0f}%")
+            fparts.append(f"Re={re_filter:.3e} ±{args.reynolds_tol * 100:.0f}%")
         if ma_filter is not None:
-            fparts.append(f"Ma={ma_filter:.4f} ±{args.mach_tol*100:.0f}%")
+            fparts.append(f"Ma={ma_filter:.4f} ±{args.mach_tol * 100:.0f}%")
         print(f"  Filtering: {', '.join(fparts)}")
         train_pool = filter_dataset_indices(
             raw_train, re_filter, ma_filter, args.reynolds_tol, args.mach_tol
@@ -462,32 +599,43 @@ def train(args: argparse.Namespace) -> None:
         )
     else:
         train_pool = list(range(len(raw_train)))
-        test_pool  = list(range(len(raw_test)))
+        test_pool = list(range(len(raw_test)))
 
-    val_size  = max(1, int(len(train_pool) * 0.1))
+    val_size = max(1, int(len(train_pool) * 0.1))
     train_idx = train_pool[: len(train_pool) - val_size]
-    val_idx   = train_pool[len(train_pool) - val_size :]
+    val_idx = train_pool[len(train_pool) - val_size :]
 
     print("  Computing normalisation stats …")
     x_mean, x_std, p_mean_t, p_std_t = compute_normalisation(raw_train, train_idx)
     norm_stats = (x_mean, x_std, p_mean_t, p_std_t)
     p_mean_v = float(p_mean_t)
-    p_std_v  = float(p_std_t)
+    p_std_v = float(p_std_t)
 
     shared_cache: dict[int, GraphGrid] = {}
     train_ds = AirfRANSNearFieldDataset(
-        args.data_root, "train", task=args.task,
-        norm_stats=norm_stats, indices=train_idx,
-        _shared_raw=raw_train, _shared_cache=shared_cache,
+        args.data_root,
+        "train",
+        task=args.task,
+        norm_stats=norm_stats,
+        indices=train_idx,
+        _shared_raw=raw_train,
+        _shared_cache=shared_cache,
     )
     val_ds = AirfRANSNearFieldDataset(
-        args.data_root, "train", task=args.task,
-        norm_stats=norm_stats, indices=val_idx,
-        _shared_raw=raw_train, _shared_cache=shared_cache,
+        args.data_root,
+        "train",
+        task=args.task,
+        norm_stats=norm_stats,
+        indices=val_idx,
+        _shared_raw=raw_train,
+        _shared_cache=shared_cache,
     )
     test_ds = AirfRANSNearFieldDataset(
-        args.data_root, "test", task=args.task,
-        norm_stats=norm_stats, indices=test_pool,
+        args.data_root,
+        "test",
+        task=args.task,
+        norm_stats=norm_stats,
+        indices=test_pool,
         _shared_raw=raw_test,
     )
     n_tr = len(train_ds)
@@ -500,31 +648,46 @@ def train(args: argparse.Namespace) -> None:
     # Important: train_ds._order must be [0, 1, ..., n_tr-1] here so that
     # W_train[i,j] corresponds to airfoil at position i vs position j.
     # Phase 2 also iterates without shuffling so the correspondence is preserved.
+    #
+    # All profiles (train + val + test) are collected upfront so that w_scale
+    # is derived from the global maximum across the full dataset.  This prevents
+    # test-set W₁ values from exceeding 1.0 when the test distribution is wider
+    # than the training distribution.
     print("\n=== Precomputing Wasserstein target matrix ===")
-    print(f"  Collecting Cp profiles for {n_tr} training airfoils …")
+    print("  Collecting Cp profiles (train / val / test) …")
     prof_tr = collect_cp_profiles_ordered(raw_train, train_ds, p_mean_v, p_std_v)
+    prof_va = collect_cp_profiles_ordered(raw_train, val_ds,   p_mean_v, p_std_v)
+    prof_te = collect_cp_profiles_ordered(raw_test,  test_ds,  p_mean_v, p_std_v)
+    all_profiles = np.concatenate([prof_tr, prof_va, prof_te])  # (A_total, N_CHORD)
 
-    print(f"  Building {n_tr}×{n_tr} W₁ matrix (vectorised) …")
+    print(f"  Building {n_tr}×{n_tr} train W₁ matrix …")
     W_train_np = build_wasserstein_matrix(prof_tr)   # (n_tr, n_tr)
 
-    # Normalise to [0, 1] so the metric regression loss has a consistent scale
-    w_scale = float(W_train_np.max()) or 1.0
+    # Scale from the global W₁ maximum across all splits so the [0,1] range is
+    # consistent for train, val, and test — no split can exceed 1.0.
+    w_scale = float(build_wasserstein_matrix(all_profiles).max()) or 1.0
     W_train_t = torch.from_numpy(W_train_np / w_scale).to(device)
-    print(f"  W₁ range: [{W_train_np.min():.4f}, {W_train_np.max():.4f}]  scale={w_scale:.4f}")
+    print(
+        f"  W₁ train range: [{W_train_np.min():.4f}, {W_train_np.max():.4f}]"
+        f"  global scale={w_scale:.4f}"
+    )
 
     # ── Model ──────────────────────────────────────────────────────────────────
     model = WassersteinEmbedder(
-        embed_dim     = args.embed_dim,
-        base_channels = args.base_channels,
-        dropout       = args.dropout,
-        K_max         = args.K_max,
+        embed_dim=args.embed_dim,
+        base_channels=args.base_channels,
+        dropout=args.dropout,
+        K_max=args.K_max,
     ).to(device)
 
     # ── Phase 1: Warmup ────────────────────────────────────────────────────────
     print(f"\n=== Phase 1: Warmup ({args.warmup_epochs} epochs) ===")
     model.set_phase(1)
-    opt1   = AdamW([p for p in model.parameters() if p.requires_grad],
-                   lr=args.lr, weight_decay=1e-4)
+    opt1 = AdamW(
+        [p for p in model.parameters() if p.requires_grad],
+        lr=args.lr,
+        weight_decay=1e-4,
+    )
     sched1 = CosineAnnealingLR(opt1, T_max=max(1, args.warmup_epochs))
 
     for epoch in tqdm(range(args.warmup_epochs), desc="warmup", unit="ep"):
@@ -533,10 +696,10 @@ def train(args: argparse.Namespace) -> None:
         train_ds.shuffle()
         for gg in train_ds:
             patches_d = gg.patches.to(device)
-            target_d  = get_airfoil_cp(gg).to(device)
+            target_d = get_airfoil_cp(gg).to(device)
             opt1.zero_grad()
-            pred  = model.warmup_forward(patches_d)
-            loss  = F.mse_loss(pred, target_d)
+            pred = model.warmup_forward(patches_d)
+            loss = F.mse_loss(pred, target_d)
             loss.backward()
             nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             opt1.step()
@@ -544,7 +707,7 @@ def train(args: argparse.Namespace) -> None:
             del patches_d, target_d, pred
         sched1.step()
         if (epoch + 1) % max(1, args.warmup_epochs // 5) == 0:
-            print(f"  [warmup] epoch {epoch+1:3d}  loss={ep_loss/n_tr:.4f}")
+            print(f"  [warmup] epoch {epoch + 1:3d}  loss={ep_loss / n_tr:.4f}")
 
     # ── Phase 2: Metric regression ─────────────────────────────────────────────
     print(f"\n=== Phase 2: Metric regression ({args.metric_epochs} epochs) ===")
@@ -553,8 +716,11 @@ def train(args: argparse.Namespace) -> None:
     # Reset iteration order to default so positions match W_train_t indices
     train_ds._order = list(range(n_tr))
 
-    opt2   = AdamW([p for p in model.parameters() if p.requires_grad],
-                   lr=args.lr, weight_decay=1e-4)
+    opt2 = AdamW(
+        [p for p in model.parameters() if p.requires_grad],
+        lr=args.lr,
+        weight_decay=1e-4,
+    )
     sched2 = CosineAnnealingLR(opt2, T_max=max(1, args.metric_epochs))
 
     # Lower-triangle mask: (n_tr, n_tr) — excludes diagonal and upper triangle
@@ -564,7 +730,37 @@ def train(args: argparse.Namespace) -> None:
 
     loss_hist:  list[float] = []
     kappa_hist: list[float] = []
-    best_loss = math.inf
+    # (loss, epoch, path) — kept sorted best-first; at most 2 entries
+    best_ckpts: list[tuple[float, int, Path]] = []
+
+    def _save_checkpoint(epoch: int, loss_val: float, kappa_val: float) -> None:
+        """Save a checkpoint and prune to keep only the best two."""
+        ckpt_path = out_dir / f"checkpoint_ep{epoch:04d}.pt"
+        torch.save(
+            {
+                "model": model.state_dict(),
+                "epoch": epoch,
+                "kappa": kappa_val,
+                "metric_loss": loss_val,
+                "w_scale": w_scale,
+                "norm_stats": {
+                    "x_mean": x_mean.cpu(), "x_std": x_std.cpu(),
+                    "p_mean": p_mean_t.cpu(), "p_std": p_std_t.cpu(),
+                },
+            },
+            ckpt_path,
+        )
+        best_ckpts.append((loss_val, epoch, ckpt_path))
+        best_ckpts.sort(key=lambda t: t[0])   # ascending loss → best first
+        # Remove any checkpoint beyond the top 2
+        while len(best_ckpts) > 2:
+            _, _, old_path = best_ckpts.pop()  # worst of the kept set
+            if old_path.exists():
+                old_path.unlink()
+        epoch_bar.write(
+            f"  checkpoint  epoch={epoch:4d}  metric_loss={loss_val:.6f}  "
+            f"κ={kappa_val:+.4f}  → {ckpt_path.name}"
+        )
 
     epoch_bar = tqdm(range(args.metric_epochs), desc="metric", unit="ep")
     for epoch in epoch_bar:
@@ -574,17 +770,17 @@ def train(args: argparse.Namespace) -> None:
         # No shuffle in phase 2 — position i must correspond to W_train_t row i.
         embs_list: list[torch.Tensor] = []
         for gg in train_ds:
-            embs_list.append(model.embed(gg.patches.to(device)))   # (1, d)
-        E = torch.cat(embs_list, dim=0)   # (n_tr, d), fully differentiable
+            embs_list.append(model.embed(gg.patches.to(device)))  # (1, d)
+        E = torch.cat(embs_list, dim=0)  # (n_tr, d), fully differentiable
 
         # Pairwise geodesic distances
-        D_geo = model.pairwise_geodesic(E)   # (n_tr, n_tr)
+        D_geo = model.pairwise_geodesic(E)  # (n_tr, n_tr)
 
         # Metric regression on unique pairs
         l_metric = F.mse_loss(D_geo[mask_tril], W_train_t[mask_tril])
 
         # Spread regularisation: push embeddings apart to prevent collapse
-        l_spread = spread_loss(E.detach(), args.spread_margin)
+        l_spread = spread_loss(E, args.spread_margin)
 
         loss = l_metric + args.spread_weight * l_spread
         opt2.zero_grad()
@@ -593,34 +789,35 @@ def train(args: argparse.Namespace) -> None:
         opt2.step()
         sched2.step()
 
-        kappa_v = model.kappa.item()
-        loss_hist.append(l_metric.item())
+        kappa_v   = model.kappa.item()
+        metric_v  = l_metric.item()
+        loss_hist.append(metric_v)
         kappa_hist.append(kappa_v)
         epoch_bar.set_postfix(
-            metric=f"{l_metric.item():.5f}",
+            metric=f"{metric_v:.5f}",
             kappa=f"{kappa_v:+.3f}",
         )
 
-        if (epoch + 1) % max(1, args.metric_epochs // 10) == 0:
-            if l_metric.item() < best_loss:
-                best_loss = l_metric.item()
-                torch.save(
-                    {
-                        "model": model.state_dict(),
-                        "epoch": epoch + 1,
-                        "kappa": kappa_v,
-                        "w_scale": w_scale,
-                        "norm_stats": {
-                            "x_mean": x_mean.cpu(), "x_std": x_std.cpu(),
-                            "p_mean": p_mean_t.cpu(), "p_std": p_std_t.cpu(),
-                        },
-                    },
-                    out_dir / "checkpoint.pt",
-                )
+        # Save every epoch if this is better than the current worst of the top-2
+        worst_kept = best_ckpts[-1][0] if len(best_ckpts) == 2 else math.inf
+        if metric_v < worst_kept:
+            _save_checkpoint(epoch + 1, metric_v, kappa_v)
 
     kappa_final = model.kappa.item()
-    geom = "hyperbolic" if kappa_final < 0 else ("spherical" if kappa_final > 0 else "Euclidean")
+    geom = (
+        "hyperbolic"
+        if kappa_final < 0
+        else ("spherical" if kappa_final > 0 else "Euclidean")
+    )
     print(f"\nFinal κ = {kappa_final:+.4f}  ({geom})")
+
+    # ── Reload best checkpoint before collecting representations ──────────────
+    if best_ckpts:
+        best_path = best_ckpts[0][2]
+        print(f"\nLoading best checkpoint: {best_path.name}  (loss={best_ckpts[0][0]:.6f})")
+        model.load_state_dict(torch.load(best_path, map_location=device)["model"])
+    else:
+        print("\nNo checkpoint saved — using final model state.")
 
     # ── Representations for visualisation ─────────────────────────────────────
     print("\n=== Collecting representations ===")
@@ -631,40 +828,38 @@ def train(args: argparse.Namespace) -> None:
 
     # AoA: only from raw_train for train/val; raw_test for test
     train_val_aoas = collect_aoas(raw_train, [train_ds, val_ds])
-    test_aoas      = collect_aoas(raw_test,  [test_ds])
+    test_aoas = collect_aoas(raw_test, [test_ds])
     all_aoas = np.concatenate([train_val_aoas, test_aoas])
 
     # Geometric shape vectors (thickness + camber profiles)
     shape_tr = collect_shape_vectors(raw_train, train_ds)
     shape_va = collect_shape_vectors(raw_train, val_ds)
-    shape_te = collect_shape_vectors(raw_test,  test_ds)
+    shape_te = collect_shape_vectors(raw_test, test_ds)
     all_shape = np.concatenate([shape_tr, shape_va, shape_te])
 
     # Pairwise distances for full set (used in distance-correlation plot)
+    # all_profiles collected before training; w_scale is the global maximum
     print("  Building full W₁ matrix …")
-    prof_va = collect_cp_profiles_ordered(raw_train, val_ds,  p_mean_v, p_std_v)
-    prof_te = collect_cp_profiles_ordered(raw_test,  test_ds, p_mean_v, p_std_v)
-    all_profiles  = np.concatenate([prof_tr, prof_va, prof_te])
-    W_all_np      = build_wasserstein_matrix(all_profiles) / w_scale
+    W_all_np = build_wasserstein_matrix(all_profiles) / w_scale
 
     with torch.no_grad():
         D_geo_all = model.pairwise_geodesic(all_embs.to(device)).cpu().numpy()
 
     # ── Final metrics ──────────────────────────────────────────────────────────
     A_all = len(all_embs)
-    tri   = np.tril_indices(A_all, k=-1)
-    r_p, _ = pearsonr(D_geo_all[tri], W_all_np[tri])
-    r_s, _ = spearmanr(D_geo_all[tri], W_all_np[tri])
+    tri = np.tril_indices(A_all, k=-1)
+    r_p = float(pearsonr(D_geo_all[tri], W_all_np[tri])[0])   # type: ignore[arg-type]
+    r_s = float(spearmanr(D_geo_all[tri], W_all_np[tri])[0])  # type: ignore[arg-type]
     print(f"\nDistance correlation (all {A_all} airfoils, {len(tri[0])} pairs):")
     print(f"  Pearson r  = {r_p:.4f}")
     print(f"  Spearman ρ = {r_s:.4f}")
 
     metrics = {
-        "pearson_r":        r_p,
-        "spearman_rho":     r_s,
-        "kappa":            kappa_final,
+        "pearson_r":        float(r_p),
+        "spearman_rho":     float(r_s),
+        "kappa":            float(kappa_final),
         "geometry":         geom,
-        "best_metric_loss": best_loss,
+        "best_metric_loss": float(best_ckpts[0][0]) if best_ckpts else None,
     }
     with open(out_dir / "metrics.json", "w") as f:
         json.dump(metrics, f, indent=2)
@@ -672,12 +867,17 @@ def train(args: argparse.Namespace) -> None:
     # ── Visualisations ─────────────────────────────────────────────────────────
     print("\n=== Saving visualisations ===")
     plot_embedding_scatter(
-        all_embs_np, all_cps, all_shape, all_aoas,
-        p_mean_v, p_std_v,
+        all_embs_np,
+        all_cps,
+        all_shape,
+        all_aoas,
+        p_mean_v,
+        p_std_v,
         out_dir / "embedding_scatter.png",
     )
     plot_distance_correlation(
-        D_geo_all, W_all_np,
+        D_geo_all,
+        W_all_np,
         out_dir / "distance_correlation.png",
     )
     plot_kappa_evolution(kappa_hist, out_dir / "kappa_evolution.png")
@@ -695,39 +895,69 @@ def _parse_args() -> argparse.Namespace:
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     # Data
-    p.add_argument("--data_root",    default="../data/AirfRANS")
-    p.add_argument("--task",         default="scarce", choices=["scarce", "full"])
-    p.add_argument("--near_field_y", type=float, default=0.6,
-                   help="Must match the value used in run.py")
+    p.add_argument("--data_root", default="../data/AirfRANS")
+    p.add_argument("--task", default="scarce", choices=["scarce", "full"])
+    p.add_argument(
+        "--near_field_y",
+        type=float,
+        default=0.6,
+        help="Must match the value used in run.py",
+    )
     # Model
-    p.add_argument("--embed_dim",     type=int,   default=64)
-    p.add_argument("--base_channels", type=int,   default=32,
-                   help="GeometricConvAutoencoder base filter count")
-    p.add_argument("--dropout",       type=float, default=0.1)
-    p.add_argument("--K_max",         type=float, default=2.0,
-                   help="Curvature clamped to (−K_max, K_max)")
+    p.add_argument("--embed_dim", type=int, default=64)
+    p.add_argument(
+        "--base_channels",
+        type=int,
+        default=32,
+        help="GeometricConvAutoencoder base filter count",
+    )
+    p.add_argument("--dropout", type=float, default=0.1)
+    p.add_argument(
+        "--K_max", type=float, default=2.0, help="Curvature clamped to (−K_max, K_max)"
+    )
     # Training
-    p.add_argument("--warmup_epochs", type=int,   default=30)
-    p.add_argument("--metric_epochs", type=int,   default=100)
-    p.add_argument("--lr",            type=float, default=3e-4)
+    p.add_argument("--warmup_epochs", type=int, default=30)
+    p.add_argument("--metric_epochs", type=int, default=100)
+    p.add_argument("--lr", type=float, default=3e-4)
     # Loss
-    p.add_argument("--spread_weight", type=float, default=0.1,
-                   help="Weight for the embedding spread regulariser")
-    p.add_argument("--spread_margin", type=float, default=0.5,
-                   help="Minimum pairwise distance encouraged by the spread loss")
+    p.add_argument(
+        "--spread_weight",
+        type=float,
+        default=0.1,
+        help="Weight for the embedding spread regulariser",
+    )
+    p.add_argument(
+        "--spread_margin",
+        type=float,
+        default=0.5,
+        help="Minimum pairwise distance encouraged by the spread loss",
+    )
     # Flow-condition filter (0 = disabled)
-    p.add_argument("--reynolds",      type=float, default=0,
-                   help="Target Re; 0 = no filter  (e.g. 3e6)")
-    p.add_argument("--reynolds_tol",  type=float, default=0.05,
-                   help="Fractional tolerance for Re filter  (default ±5%%)")
-    p.add_argument("--mach",          type=float, default=0,
-                   help="Target Ma; 0 = no filter  (e.g. 0.15)")
-    p.add_argument("--mach_tol",      type=float, default=0.05,
-                   help="Fractional tolerance for Ma filter  (default ±5%%)")
+    p.add_argument(
+        "--reynolds",
+        type=float,
+        default=3e6,
+        help="Target Re; 0 = no filter  (e.g. 3e6)",
+    )
+    p.add_argument(
+        "--reynolds_tol",
+        type=float,
+        default=0.05,
+        help="Fractional tolerance for Re filter  (default ±5%%)",
+    )
+    p.add_argument(
+        "--mach", type=float, default=0, help="Target Ma; 0 = no filter  (e.g. 0.15)"
+    )
+    p.add_argument(
+        "--mach_tol",
+        type=float,
+        default=0.05,
+        help="Fractional tolerance for Ma filter  (default ±5%%)",
+    )
     # Misc
     p.add_argument("--out_dir", default="results/wass_embedding")
-    p.add_argument("--seed",    type=int, default=42)
-    p.add_argument("--cpu",     action="store_true")
+    p.add_argument("--seed", type=int, default=69)
+    p.add_argument("--cpu", action="store_true")
     return p.parse_args()
 
 
@@ -735,4 +965,4 @@ if __name__ == "__main__":
     args = _parse_args()
     t0 = time.time()
     train(args)
-    print(f"\nTotal wall time: {(time.time()-t0)/60:.1f} min")
+    print(f"\nTotal wall time: {(time.time() - t0) / 60:.1f} min")
