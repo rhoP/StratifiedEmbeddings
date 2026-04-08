@@ -1,40 +1,51 @@
 """
-run_airfrans.py — Train & evaluate StratifiedDQE on the AirfRANS dataset.
+run_airfrans.py — Shape-Stratified DQE for AirfRANS airfoils.
 
-Usage examples
---------------
-  # Full run with defaults
-  python run_airfrans.py --out_dir results/airfrans
+Objective
+---------
+Discover K shape families among airfoil geometries, where each stratum is
+defined by its characteristic pressure distribution.  Pressure acts as the
+ground-truth lens: strata that group airfoils with similar Cp behaviour are
+rewarded, so the K strata implicitly learn aerodynamically meaningful shape
+classes (thin/thick, high/low camber, leading-edge type, etc.).
 
-  # Quicker smoke-test (2 strata, small model, 10 warmup epochs)
-  python run_airfrans.py --n_strata 2 --embed_dim 16 --warmup_epochs 10 --full_epochs 20
-
-  # Resume from a saved checkpoint
-  python run_airfrans.py --resume results/airfrans/checkpoint.pt
+Architecture
+------------
+For each airfoil simulation:
+  1. Interpolate the near-field to a 128×128 grid; extract 32×32 patches.
+  2. ShapeEncoder (GeometricConvAutoencoder CNN body + AdaptiveAvgPool):
+       input  — shape-only channels [x, y, SDF, nx, ny] (inlet velocity excluded)
+       output — (P, embed_dim) per-patch embeddings
+  3. Mean-pool over patches → (1, embed_dim) per-airfoil embedding.
+  4. StratumAssigner → (1, K) soft assignment weights.
+  5. K × StratumDQE heads, each predicting mean surface Cp.
+  6. Weighted mixture → final Cp prediction.
 
 Training phases
 ---------------
-1. Warmup regressor   (--warmup_epochs)
-2. K-means cluster    (runs once after warmup, no epochs)
-3. Stratum assigner   (--assigner_epochs)
-4. Full joint train   (--full_epochs)
+1. Warmup   — ShapeEncoder + linear head, plain MSE on mean surface Cp.
+2. K-means  — cluster pooled embeddings; initialise assigner + DQE prototypes.
+3. Assigner — train StratumAssigner to reproduce K-means labels (encoder frozen).
+4. Full     — all parameters; loss = MSE + entropy + curvature_diversity + centripetal.
 
-AirfRANS specifics
-------------------
-- Raw dataset has no edge_index; we build a KNN graph (k=--knn_k).
-- Node features: 5 (x, y, SDF, normals_x, normals_y)  + 2 (spatial coords)
-  → concatenated: in_dim = 7
-- Node targets: 4 (u_x, u_y, pressure, ν_t)
-- data.surf: boolean mask for airfoil surface nodes (used in loss weighting)
-- Each sample is a full CFD simulation (~180 k nodes).  Training uses
-  NeighborLoader with --batch_size seed nodes and --num_neighbors fanout
-  per hop; inference always runs on the full graph.
+Visualisations (auto-generated after training)
+----------------------------------------------
+  training_curves.png        — loss components over phase 4
+  curvature_evolution.png    — κ per stratum over phase 4
+  stratum_scatter.png        — embedding PCA; left=stratum colour, right=Cp colour
+  stratum_distributions.png  — violin: Cp distribution per stratum
+  stratum_cp_profiles.png    — mean chord-wise Cp profile per stratum (± 1σ band)
+  shape_stratum.png          — geometric shape PCA coloured by stratum assignment
+
+Usage
+-----
+  python run_airfrans.py --out_dir results/shape_strata
+  python run_airfrans.py --n_strata 2 --embed_dim 32 --warmup_epochs 5 --full_epochs 20
 """
 
 from __future__ import annotations
 
 import argparse
-import gc
 import json
 import math
 import random
@@ -42,349 +53,660 @@ import time
 from pathlib import Path
 from typing import cast
 
+import matplotlib.pyplot as plt
 import numpy as np
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
+from scipy.stats import pearsonr
+from tqdm import tqdm
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch_geometric.datasets import AirfRANS
-from torch_geometric.transforms import KNNGraph
 from torch_geometric.data import Data
-from torch_geometric.loader import NeighborLoader
 
-from StratifiedEmbedding import (
-    StratifiedDQE,
-    StratumDQE,
-    total_loss,
-    prediction_diversity_loss,
-    conditional_diversity_loss,
-    plot_training_curves,
-    plot_curvature_evolution,
-    plot_stratum_assignments,
-    plot_prediction_scatter,
-    plot_geometry_summary,
+# ── Shared data pipeline from run.py ─────────────────────────────────────────
+from run import (
+    NEAR_FIELD_BOUNDS,
+    GRID_H, GRID_W,
+    N_PATCHES, P_IDX, N_CHORD,
+    GraphGrid,
+    AirfRANSNearFieldDataset,
+    compute_normalisation,
+    collect_shape_vectors,
 )
 
-# ── Constants ────────────────────────────────────────────────────────────────
+# ── CNN backbone ──────────────────────────────────────────────────────────────
+from models.GeometricCNNAutoencoder import GeometricConvAutoencoder
 
-TARGET_NAMES = ["u_x", "u_y", "p", "nu_t"]
-N_TARGETS = 4
-BASE_IN_DIM = 5  # raw AirfRANS node features (excl. spatial pos)
+# ── DQE components ────────────────────────────────────────────────────────────
+from StratifiedEmbedding import (
+    StratumAssigner,
+    StratumDQE,
+    WarmupRegressor,
+    stratum_entropy_loss,
+    curvature_diversity_loss,
+    centripetal_loss,
+)
+
+# ── Constants ─────────────────────────────────────────────────────────────────
+# Channel indices in the 7-channel patch [x, y, u_x_inf, u_y_inf, SDF, nx, ny]
+# Shape-only: drop inlet velocity (indices 2, 3)
+_FLOW_IDX  = [0, 1, 4]   # x, y, SDF  → "flow" channels for GeometricConvAutoencoder
+_GEOM_IDX  = [5, 6]       # nx, ny     → "geometry" channels
+_BASE_CH   = 32           # GeometricConvAutoencoder base channels
+
+# Air properties at ~20 °C / sea level (used to compute Re and Ma from U_inf)
+_RHO   = 1.2          # kg/m³  — density
+_MU    = 1.8e-5       # Pa·s   — dynamic viscosity
+_C_SND = 340.0        # m/s    — speed of sound
+_CHORD = 1.0          # m      — reference chord length (AirfRANS convention)
 
 
-# ── Data utilities ───────────────────────────────────────────────────────────
+# ── Model ─────────────────────────────────────────────────────────────────────
 
 
-class AirfRANSDataset:
-    """Lazy per-sample loader that builds KNN edges on first access.
+class ShapeEncoder(nn.Module):
+    """CNN patch encoder built on the GeometricConvAutoencoder backbone.
 
-    PyG's raw ``AirfRANS`` files (~8 MB each, no edges) are loaded one at a
-    time.  On the first access to each graph, a KNN graph is built from node
-    positions and the resulting ``edge_index`` is stored in a RAM dict.
-    Subsequent accesses reuse the cached tensor — no KNN recomputation, no
-    extra disk files.
-
-    For the "scarce" task (~200 graphs, default) the edge cache is ~4–5 GB.
-    For "full" (~800 graphs) it scales proportionally; use --task full only
-    when you have the RAM to spare.
+    Selects shape-only channels [x, y, SDF, nx, ny] from the full 7-channel
+    patches before encoding.  The CNN body is taken directly from
+    ``GeometricConvAutoencoder`` (4 stride-2 conv blocks), and an
+    ``AdaptiveAvgPool2d(1)`` + linear projection replace the original
+    flatten+FC so the encoder is patch-size-agnostic.
 
     Parameters
     ----------
-    task : "scarce" | "full"
-        AirfRANS task variant.  "scarce" is the default.
+    embed_dim     : output embedding dimension
+    base_channels : base filter count for GeometricConvAutoencoder (default 32;
+                    final conv channel count = base_channels * 8)
+    dropout       : dropout before projection
     """
 
     def __init__(
         self,
-        root: str,
-        split: str,
-        task: str = "scarce",
-        knn_k: int = 8,
-        norm_stats: tuple[torch.Tensor, torch.Tensor,
-                          torch.Tensor, torch.Tensor] | None = None,
-        indices: list[int] | None = None,
-        _shared_raw: AirfRANS | None = None,
-        _shared_edge_cache: dict[int, torch.Tensor] | None = None,
+        embed_dim: int,
+        base_channels: int = _BASE_CH,
+        dropout: float = 0.1,
     ) -> None:
-        # Re-use a caller-supplied AirfRANS instance when available so that
-        # multiple views (train, val, normalisation) never duplicate the
-        # in-memory dataset.  If none is supplied we create our own.
-        self._raw: AirfRANS = (
-            _shared_raw
-            if _shared_raw is not None
-            else AirfRANS(root=root, task=task, train=(split == "train"))
+        super().__init__()
+        # Borrow the CNN body (nn.Sequential) — 4 stride-2 conv blocks,
+        # output shape (P, base_channels*8, H/16, W/16).
+        _cae = GeometricConvAutoencoder(
+            latent_dim=embed_dim,
+            flow_channels=len(_FLOW_IDX),
+            geom_channels=len(_GEOM_IDX),
+            base_channels=base_channels,
         )
-        self._knn = KNNGraph(k=knn_k, loop=False, force_undirected=True)
-        # Similarly share the edge-index cache so KNN is built at most once
-        # per unique graph across all views.
-        self._edge_cache: dict[int, torch.Tensor] = (
-            _shared_edge_cache if _shared_edge_cache is not None else {}
-        )
-        n = len(self._raw)
-        self._indices: list[int] = (
-            list(indices) if indices is not None else list(range(n))
-        )
-        self._order: list[int] = list(range(len(self._indices)))
-        self.norm_stats = norm_stats
+        self.cnn     = _cae.encoder            # (P, _SHAPE_CH, H, W) → (P, BC*8, h, w)
+        self.pool    = nn.AdaptiveAvgPool2d(1)
+        self.proj    = nn.Linear(base_channels * 8, embed_dim)
+        self.dropout = nn.Dropout(dropout)
 
-    # ── public API ─────────────────────────────────────────────────────────────
-
-    @property
-    def in_dim(self) -> int:
-        """Feature dimension — peeked from first graph (always pos + x = 7)."""
-        x = self[0].x
-        assert x is not None
-        return int(x.shape[1])
-
-    def __len__(self) -> int:
-        return len(self._indices)
-
-    def __getitem__(self, pos: int) -> Data:
-        raw_idx = self._indices[self._order[pos]]
-        raw: Data = self._raw[raw_idx]  # type: ignore[assignment]
-
-        # Build KNN on first access; subsequent calls hit the RAM cache.
-        if raw_idx not in self._edge_cache:
-            # KNNGraph only needs pos — feed a minimal Data to avoid copying
-            # the full feature/target tensors through the transform.
-            pos_data = Data(
-                pos=cast(torch.Tensor, raw.pos),
-                num_nodes=raw.num_nodes,
-            )
-            self._edge_cache[raw_idx] = cast(
-                torch.Tensor, self._knn(pos_data).edge_index
-            ).long()
-        edge_index = self._edge_cache[raw_idx]
-
-        x_feat = cast(torch.Tensor, raw.x).float()
-        pos_   = cast(torch.Tensor, raw.pos).float()
-        x_aug  = torch.cat([pos_, x_feat], dim=-1)   # (N, 7)
-        y      = cast(torch.Tensor, raw.y).float()
-        surf   = (
-            cast(torch.Tensor, raw.surf).bool()
-            if hasattr(raw, "surf") and raw.surf is not None
-            else torch.zeros(x_aug.shape[0], dtype=torch.bool)
-        )
-        if self.norm_stats is not None:
-            x_mean, x_std, y_mean, y_std = self.norm_stats
-            x_aug = (x_aug - x_mean) / x_std
-            y     = (y     - y_mean) / y_std
-        return Data(
-            x=x_aug,
-            edge_index=edge_index,
-            y=y,
-            surf=surf,
-            num_nodes=x_aug.shape[0],
-        )
-
-    def __iter__(self):
-        for i in range(len(self)):
-            yield self[i]
-
-    def shuffle(self) -> None:
-        """Randomly permute the iteration order for the next epoch."""
-        random.shuffle(self._order)
+    def forward(self, patches: torch.Tensor) -> torch.Tensor:
+        """patches : (P, 7, H, W) → (P, embed_dim)"""
+        x = torch.cat([
+            patches[:, _FLOW_IDX, :, :],   # (P, 3, H, W)
+            patches[:, _GEOM_IDX, :, :],   # (P, 2, H, W)
+        ], dim=1)                           # (P, 5, H, W)
+        x = self.cnn(x)                    # (P, BC*8, h, w)
+        x = self.pool(x).flatten(1)        # (P, BC*8)
+        return self.proj(self.dropout(x))  # (P, embed_dim)
 
 
-def make_neighbor_loader(
-    data: Data,
-    batch_size: int,
-    num_neighbors: list[int],
-    shuffle: bool = True,
-) -> NeighborLoader:
-    """NeighborLoader for GraphSAGE-style mini-batch training.
+class ShapeStratifiedDQE(nn.Module):
+    """Shape-Stratified DQE: CNN patch encoder + graph pooling + K DQE heads.
 
-    Each mini-batch contains `batch_size` seed nodes plus their sampled
-    k-hop neighborhoods.  The first `batch.batch_size` rows of every batch
-    tensor correspond to the seed nodes; only those rows contribute to the
-    loss.  Neighbor rows are used solely for message passing.
+    One model instance processes one airfoil simulation at a time.
+    ``pool_patches`` encodes all patches and mean-pools them to a single
+    (1, embed_dim) airfoil-level embedding.  The ``StratumAssigner`` softly
+    routes the airfoil to K strata; each ``StratumDQE`` predicts mean
+    surface Cp within that stratum.
 
-    This preserves graph connectivity — every seed node has real neighbors —
-    unlike random node subsampling which retains ~(batch_size/N)² of edges.
+    Phases mirror StratifiedDQE conventions:
+      1 — ShapeEncoder + warmup_head
+      2 — StratumAssigner only (encoder frozen)
+      3 — everything except warmup_head
     """
-    return NeighborLoader(
-        data,
-        num_neighbors=num_neighbors,
-        batch_size=batch_size,
-        shuffle=shuffle,
-        num_workers=0,
-    )
 
+    def __init__(
+        self,
+        embed_dim:     int,
+        n_strata:      int,
+        n_intervals:   int,
+        n_protos:      int,
+        base_channels: int   = _BASE_CH,
+        dropout:       float = 0.1,
+        K_max:         float = 2.0,
+        interval_temp: float = 0.5,
+        proto_temp:    float = 1.0,
+    ) -> None:
+        super().__init__()
+        self.n_strata  = n_strata
+        self.embed_dim = embed_dim
 
-# ── Normalisation ─────────────────────────────────────────────────────────────
+        self.encoder     = ShapeEncoder(embed_dim, base_channels, dropout)
+        self.assigner    = StratumAssigner(embed_dim, n_strata)
+        self.dqes        = nn.ModuleList([
+            StratumDQE(embed_dim, n_intervals, n_protos, n_targets=1,
+                       K_max=K_max, interval_temp=interval_temp,
+                       proto_temp=proto_temp)
+            for _ in range(n_strata)
+        ])
+        self.warmup_head = WarmupRegressor(embed_dim, n_targets=1)
 
+    # ── phase gating ──────────────────────────────────────────────────────────
 
-def compute_normalisation_streaming(
-    dataset: AirfRANSDataset,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Streaming mean/std over all graphs — never holds more than one graph in RAM.
+    def set_phase(self, phase: int) -> None:
+        for p in self.parameters():
+            p.requires_grad_(False)
+        if phase == 1:
+            for p in self.encoder.parameters():     p.requires_grad_(True)
+            for p in self.warmup_head.parameters(): p.requires_grad_(True)
+        elif phase == 2:
+            for p in self.assigner.parameters():    p.requires_grad_(True)
+        elif phase == 3:
+            for p in self.encoder.parameters():     p.requires_grad_(True)
+            for p in self.assigner.parameters():    p.requires_grad_(True)
+            for dqe in self.dqes:
+                for p in dqe.parameters():          p.requires_grad_(True)
 
-    Uses the online accumulation formula:
-        mean  = Σx / N
-        var   = Σx² / N − mean²   (cancelled by clamp to handle fp rounding)
-    """
-    # Peek at first graph to learn feature dimensions, then initialise accumulators.
-    first = dataset[0]
-    assert first.x is not None
-    x0 = first.x.float()
-    y0 = cast(torch.Tensor, first.y).float()
-    x_sum  = torch.zeros(x0.shape[1])
-    x_sum2 = torch.zeros(x0.shape[1])
-    y_sum  = torch.zeros(y0.shape[1])
-    y_sum2 = torch.zeros(y0.shape[1])
-    n_x = n_y = 0
+    # ── forward helpers ───────────────────────────────────────────────────────
 
-    for data in dataset:
-        assert data.x is not None
-        x = data.x.float()                        # (N, Fx)
-        y = cast(torch.Tensor, data.y).float()    # (N, Fy)
-        x_sum  += x.sum(0);  x_sum2 += (x ** 2).sum(0)
-        y_sum  += y.sum(0);  y_sum2 += (y ** 2).sum(0)
-        n_x += x.shape[0]
-        n_y += y.shape[0]
+    def pool_patches(self, patches: torch.Tensor) -> torch.Tensor:
+        """Encode all patches and mean-pool → (1, embed_dim)."""
+        return self.encoder(patches).mean(0, keepdim=True)
 
-    x_mean = x_sum / n_x
-    x_std  = ((x_sum2 / n_x) - x_mean ** 2).clamp(min=0).sqrt().clamp(min=1e-6)
-    y_mean = y_sum / n_y
-    y_std  = ((y_sum2 / n_y) - y_mean ** 2).clamp(min=0).sqrt().clamp(min=1e-6)
-    return x_mean, x_std, y_mean, y_std
+    def warmup_forward(self, patches: torch.Tensor) -> torch.Tensor:
+        """Phase 1: pooled embedding → linear head → (1, 1) Cp prediction."""
+        return self.warmup_head(self.pool_patches(patches))
+
+    def forward(
+        self, patches: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Full forward pass (phase 3).
+
+        Returns
+        -------
+        pred       : (1, 1)             weighted-mixture Cp prediction
+        soft       : (1, K)             soft stratum assignments
+        g          : (1, embed_dim)     airfoil embedding
+        protos_tan : (K, n_protos, d)   prototype tangent coordinates
+        kappas     : (K,)               learnable curvature per stratum
+        """
+        g    = self.pool_patches(patches)                 # (1, d)
+        soft = self.assigner(g)                           # (1, K)
+
+        preds, kappas = [], []
+        for dqe in self.dqes:
+            assert isinstance(dqe, StratumDQE)
+            p, _, _ = dqe(g)
+            preds.append(p)
+            kappas.append(dqe.kappa)
+
+        preds_stack = torch.stack(preds, dim=1)                   # (1, K, 1)
+        pred        = (soft.unsqueeze(-1) * preds_stack).sum(1)   # (1, 1)
+        kappas_t    = torch.stack(kappas)                          # (K,)
+        protos_tan  = torch.stack(
+            [d.protos_tan for d in self.dqes if isinstance(d, StratumDQE)]
+        )                                                           # (K, P, d)
+
+        return pred, soft, g, protos_tan, kappas_t
+
+    # ── K-means initialisation ────────────────────────────────────────────────
+
+    @torch.no_grad()
+    def init_from_kmeans(
+        self,
+        centres:    torch.Tensor,   # (K, d)
+        labels:     torch.Tensor,   # (A,)
+        all_embeds: torch.Tensor,   # (A, d)
+    ) -> None:
+        self.assigner.init_centroids(centres)
+        dqe_list = [d for d in self.dqes if isinstance(d, StratumDQE)]
+        for k, dqe in enumerate(dqe_list):
+            mask = labels == k
+            if mask.sum() == 0:
+                continue
+            cluster_e = all_embeds[mask]
+            P   = dqe.n_protos
+            idx = torch.randperm(cluster_e.shape[0])[:P]
+            if idx.numel() > 0:
+                dqe.protos_tan.data[:idx.numel()].copy_(cluster_e[idx])
 
 
 # ── Training helpers ──────────────────────────────────────────────────────────
 
 
+def get_airfoil_cp(gg: GraphGrid) -> torch.Tensor:
+    """Return (1, 1) mean surface Cp (normalised) from patch data."""
+    smask = gg.patch_surf
+    p     = gg.patch_pressure
+    val   = p[smask].mean() if smask.any() else p.mean()
+    return val.view(1, 1)
+
+
 @torch.no_grad()
-def collect_embeddings(
-    model: StratifiedDQE,
-    dataset: AirfRANSDataset,
-    device: torch.device,
-    max_embed_nodes: int = 500_000,
-) -> torch.Tensor:
-    """Sample embeddings from each graph for k-means — never all at once.
+def collect_airfoil_embeddings(
+    model:   ShapeStratifiedDQE,
+    dataset: AirfRANSNearFieldDataset,
+    device:  torch.device,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Collect per-airfoil (embed, soft_assign, cp) for all graphs in dataset.
 
-    Per-graph quota = max_embed_nodes // len(dataset), so total samples stay
-    within budget regardless of dataset size.  Full-graph inference runs under
-    no_grad; only a random subset is kept in CPU RAM.
-
-    Each graph's device tensors are explicitly freed after encoding so that
-    GPU memory from one graph is released before the next is loaded.
-    Call ``torch.cuda.empty_cache()`` before invoking this function to
-    maximise headroom (optimizer states from Phase 1 may still be cached).
+    Returns
+    -------
+    embeds : (A, embed_dim)
+    softs  : (A, K)
+    cps    : (A,)         normalised mean surface Cp
     """
     model.eval()
-    quota = max(1, max_embed_nodes // len(dataset))
-    all_embeds: list[torch.Tensor] = []
-    for data in dataset:
-        d = data.to(device)
-        assert d.x is not None and d.edge_index is not None
-        e = model.encode(d.x, d.edge_index)   # (N, d)  — on device
-        n = e.shape[0]
-        if n > quota:
-            idx = torch.randperm(n, device=device)[:quota]
-            e = e[idx]
-        all_embeds.append(e.cpu())
-        del d, e   # free device tensors before loading the next graph
-    return torch.cat(all_embeds, dim=0)
+    embeds, softs, cps = [], [], []
+    for gg in dataset:
+        patches_d = gg.patches.to(device)
+        _, soft, g, _, _ = model(patches_d)
+        embeds.append(g.cpu())
+        softs.append(soft.cpu())
+        cps.append(get_airfoil_cp(gg).squeeze())
+        del patches_d, soft, g
+    return (
+        torch.cat(embeds, dim=0),
+        torch.cat(softs,  dim=0),
+        torch.stack(cps),
+    )
+
+
+@torch.no_grad()
+def collect_pooled_embeddings(
+    model:   ShapeStratifiedDQE,
+    dataset: AirfRANSNearFieldDataset,
+    device:  torch.device,
+) -> torch.Tensor:
+    """(A, embed_dim) — used for K-means initialisation after Phase 1."""
+    model.eval()
+    embs = []
+    for gg in dataset:
+        g = model.pool_patches(gg.patches.to(device))
+        embs.append(g.cpu())
+        del g
+    return torch.cat(embs, dim=0)
 
 
 def kmeans_cluster(
-    embeds: torch.Tensor,
+    embeds:    torch.Tensor,
     n_clusters: int,
-    n_iter: int = 100,
-    seed: int = 42,
+    n_iter:    int  = 100,
+    seed:      int  = 42,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Simple Lloyd k-means in Euclidean space.
-
-    Returns (centroids (K, d), labels (N,)).
-    """
+    """Lloyd k-means in Euclidean space.  Returns (centroids (K,d), labels (N,))."""
     torch.manual_seed(seed)
     N = embeds.shape[0]
-    perm = torch.randperm(N)[:n_clusters]
-    centroids = embeds[perm].clone()
-
-    labels = torch.zeros(N, dtype=torch.long)
+    centroids = embeds[torch.randperm(N)[:n_clusters]].clone()
+    labels    = torch.zeros(N, dtype=torch.long)
     for _ in range(n_iter):
-        # cdist avoids materialising the (N, K, d) diff tensor.
-        dists = torch.cdist(embeds, centroids)  # (N, K) squared-euclidean
-        new_labels = dists.argmin(dim=-1)       # (N,)
-
+        new_labels = torch.cdist(embeds, centroids).argmin(dim=-1)
         if (new_labels == labels).all():
             break
         labels = new_labels
-
         for k in range(n_clusters):
             mask = labels == k
             if mask.sum() > 0:
                 centroids[k] = embeds[mask].mean(0)
-
     return centroids, labels
 
 
 @torch.no_grad()
 def evaluate(
-    model: StratifiedDQE,
-    dataset: AirfRANSDataset,
-    device: torch.device,
-    y_mean: torch.Tensor,
-    y_std: torch.Tensor,
-    surf_weight: float = 10.0,
+    model:   ShapeStratifiedDQE,
+    dataset: AirfRANSNearFieldDataset,
+    device:  torch.device,
 ) -> dict[str, float]:
-    """Streaming weighted MSE and per-target R² — never holds all predictions in RAM.
-
-    Accumulates per-graph squared errors and sufficient statistics for R²
-    (true_sum, true_sq) so the final metrics are computed from running sums.
-    """
+    """MSE and R² on mean-surface-Cp prediction (normalised)."""
     model.eval()
-    y_mean_cpu = y_mean.cpu()
-    y_std_cpu  = y_std.cpu()
+    preds, targets = [], []
+    for gg in dataset:
+        pred, _, _, _, _ = model(gg.patches.to(device))
+        preds.append(pred.item())
+        targets.append(get_airfoil_cp(gg).item())
+    preds   = np.array(preds)
+    targets = np.array(targets)
+    mse     = float(np.mean((preds - targets) ** 2))
+    ss_res  = float(np.sum((preds - targets) ** 2))
+    ss_tot  = float(np.sum((targets - targets.mean()) ** 2))
+    r2      = float(1.0 - ss_res / max(ss_tot, 1e-12))
+    return {"mse": mse, "r2": r2}
 
-    surf_se = torch.zeros(N_TARGETS)   # Σ squared errors on surface nodes (per target)
-    vol_se  = torch.zeros(N_TARGETS)   # Σ squared errors on volume  nodes
-    surf_n  = 0
-    vol_n   = 0
 
-    res_sq   = torch.zeros(N_TARGETS)  # Σ (pred − true)² per target
-    true_sum = torch.zeros(N_TARGETS)  # Σ true, for computing global mean
-    true_sq  = torch.zeros(N_TARGETS)  # Σ true², for computing Var[true]
-    total_n  = 0
+# ── Chord-wise Cp profiles ────────────────────────────────────────────────────
 
-    for data in dataset:
-        d = data.to(device)
-        assert d.x is not None and d.edge_index is not None
-        y_t    = cast(torch.Tensor, d.y)
-        surf_t = cast(torch.Tensor, d.surf)
-        pred_d, _, _, _, _, _ = model(d.x, d.edge_index)
-        pred_dn = (pred_d * y_std + y_mean).cpu()          # (N, T) denormalised
-        true_dn = y_t.cpu() * y_std_cpu + y_mean_cpu       # (N, T)
-        smask   = surf_t.cpu().bool()                       # (N,)
 
-        se = (pred_dn - true_dn) ** 2                      # (N, T)
-        surf_se += se[smask].sum(0)
-        vol_se  += se[~smask].sum(0)
-        surf_n  += int(smask.sum())
-        vol_n   += int((~smask).sum())
+def compute_cp_profile(surf_pos: np.ndarray, surf_cp: np.ndarray) -> np.ndarray:
+    """Mean upper+lower chord-wise Cp at N_CHORD stations.
 
-        res_sq   += se.sum(0)
-        true_sum += true_dn.sum(0)
-        true_sq  += (true_dn ** 2).sum(0)
-        total_n  += true_dn.shape[0]
+    Mirrors the split logic of ``compute_shape_vector`` but interpolates
+    pressure instead of geometry, then averages upper and lower surfaces
+    to give the mean chord loading at each station.
 
-    # Weighted MSE: average per-element error, weighted by node type
-    T        = N_TARGETS
-    surf_mse = float(surf_se.sum()) / max(surf_n * T, 1)
-    vol_mse  = float(vol_se.sum())  / max(vol_n  * T, 1)
-    mse_w    = (surf_mse * surf_weight + vol_mse) / (surf_weight + 1)
+    Returns (N_CHORD,) array; zeros on degenerate input.
+    """
+    if surf_pos.shape[0] < 10:
+        return np.zeros(N_CHORD)
+    x, y  = surf_pos[:, 0], surf_pos[:, 1]
+    chord = x.max() - x.min()
+    if chord < 1e-6:
+        return np.zeros(N_CHORD)
+    x_n   = (x - x.min()) / chord
 
-    # R² = 1 − Σ(pred−true)² / (N · Var[true])
-    true_mean = true_sum / total_n
-    true_var  = (true_sq / total_n - true_mean ** 2).clamp(min=1e-12)
-    r2_per    = (1.0 - res_sq / (total_n * true_var)).tolist()
+    y_mid  = y.mean()
+    upper  = y >= y_mid
+    lower  = y <  y_mid
+    if upper.sum() < 6 or lower.sum() < 6:
+        return np.zeros(N_CHORD)
 
-    return {
-        "weighted_mse": mse_w,
-        **{f"r2_{TARGET_NAMES[t]}": float(r2_per[t]) for t in range(N_TARGETS)},
-        "r2_mean": float(np.mean(r2_per)),
-    }
+    x_grid = np.linspace(0.0, 1.0, N_CHORD)
+    su     = np.argsort(x_n[upper])
+    cp_up  = np.interp(x_grid, x_n[upper][su], surf_cp[upper][su])
+    sl     = np.argsort(x_n[lower])
+    cp_lo  = np.interp(x_grid, x_n[lower][sl], surf_cp[lower][sl])
+    return (cp_up + cp_lo) / 2.0
+
+
+def collect_cp_profiles(
+    raw_ds:     AirfRANS,
+    dataset:    AirfRANSNearFieldDataset,
+    p_mean:     float,
+    p_std:      float,
+) -> np.ndarray:
+    """(A, N_CHORD) normalised mean chord-wise Cp for all airfoils in dataset."""
+    profiles: list[np.ndarray] = []
+    for i in tqdm(range(len(dataset)), desc="  Cp profiles", leave=False, unit="g"):
+        raw_idx = dataset._indices[dataset._order[i]]
+        raw: Data = raw_ds[raw_idx]    # type: ignore[assignment]
+        pos  = cast(torch.Tensor, raw.pos).float().numpy()
+        surf = (
+            cast(torch.Tensor, raw.surf).bool().numpy()
+            if hasattr(raw, "surf") and raw.surf is not None
+            else np.zeros(pos.shape[0], dtype=bool)
+        )
+        p_raw = cast(torch.Tensor, raw.y).float().numpy()[:, P_IDX]
+        p_norm = (p_raw - p_mean) / p_std
+        profiles.append(compute_cp_profile(pos[surf], p_norm[surf]))
+    return np.stack(profiles)
+
+
+# ── Visualisations ────────────────────────────────────────────────────────────
+
+
+def plot_training_curves(
+    history:    dict[str, list[float]],
+    kappa_hist: list[list[float]],
+    out_dir:    Path,
+) -> None:
+    """Loss components and curvature evolution — two separate figures."""
+    keys = ["total", "regression", "entropy", "diversity", "centripetal"]
+
+    # ── loss curves ───────────────────────────────────────────────────────────
+    fig, axes = plt.subplots(1, len(keys), figsize=(5 * len(keys), 4))
+    for ax, key in zip(axes, keys):
+        if key in history and history[key]:
+            ax.plot(history[key])
+        ax.set_title(key)
+        ax.set_xlabel("epoch (phase 4)")
+        ax.set_ylabel("loss")
+        ax.grid(lw=0.4, alpha=0.5)
+    plt.tight_layout()
+    p = out_dir / "training_curves.png"
+    plt.savefig(p, dpi=120, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  Saved {p}")
+
+    # ── curvature evolution ────────────────────────────────────────────────────
+    if not kappa_hist:
+        return
+    kappa_arr = np.array(kappa_hist)   # (epochs, K)
+    fig, ax = plt.subplots(figsize=(8, 4))
+    for k in range(kappa_arr.shape[1]):
+        ax.plot(kappa_arr[:, k], label=f"Stratum {k}")
+    ax.axhline(0, color="k", lw=0.5, ls="--")
+    ax.set_xlabel("epoch (phase 4)")
+    ax.set_ylabel("κ  (negative=hyperbolic, positive=spherical)")
+    ax.set_title("Curvature evolution per stratum")
+    ax.legend(loc="best", fontsize=9)
+    ax.grid(lw=0.4, alpha=0.5)
+    plt.tight_layout()
+    p = out_dir / "curvature_evolution.png"
+    plt.savefig(p, dpi=120, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  Saved {p}")
+
+
+def plot_stratum_scatter(
+    all_embeds: np.ndarray,    # (A, d)
+    all_labels: np.ndarray,    # (A,)  hard stratum index
+    all_cp:     np.ndarray,    # (A,)  normalised mean surface Cp
+    n_strata:   int,
+    p_mean:     float,
+    p_std:      float,
+    out_path:   Path,
+) -> None:
+    """PCA of airfoil embeddings: left = stratum colour, right = Cp colour."""
+    E_c    = all_embeds - all_embeds.mean(0)
+    _, _, Vt = np.linalg.svd(E_c, full_matrices=False)
+    coords = E_c @ Vt[:2].T   # (A, 2)
+    cp_phys = all_cp * p_std + p_mean
+
+    cmap = plt.get_cmap("tab10")
+    fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+
+    # Stratum colour
+    ax = axes[0]
+    for k in range(n_strata):
+        m = all_labels == k
+        ax.scatter(
+            coords[m, 0], coords[m, 1],
+            color=cmap(k / max(n_strata - 1, 1)),
+            s=45, alpha=0.85, edgecolors="k", linewidths=0.3,
+            label=f"S{k}  (n={m.sum()})",
+        )
+    ax.set_xlabel("Embedding PC 1")
+    ax.set_ylabel("Embedding PC 2")
+    ax.set_title("Shape embedding space — coloured by stratum")
+    ax.legend(loc="best", fontsize=9)
+    ax.grid(lw=0.3, alpha=0.4)
+
+    # Cp colour
+    ax = axes[1]
+    sc = ax.scatter(
+        coords[:, 0], coords[:, 1],
+        c=cp_phys, cmap="RdBu_r",
+        s=45, edgecolors="k", linewidths=0.3, alpha=0.88,
+    )
+    fig.colorbar(sc, ax=ax, label="Mean surface Cp")
+    ax.set_xlabel("Embedding PC 1")
+    ax.set_ylabel("Embedding PC 2")
+    ax.set_title("Shape embedding space — coloured by mean Cp")
+    ax.grid(lw=0.3, alpha=0.4)
+
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  Saved {out_path}")
+
+
+def plot_stratum_distributions(
+    all_labels: np.ndarray,
+    all_cp:     np.ndarray,
+    n_strata:   int,
+    p_mean:     float,
+    p_std:      float,
+    out_path:   Path,
+) -> None:
+    """Violin plot of Cp distribution per stratum."""
+    cp_phys = all_cp * p_std + p_mean
+    data    = [cp_phys[all_labels == k] for k in range(n_strata)]
+    filled  = [d if len(d) > 0 else np.array([0.0]) for d in data]
+
+    fig, ax = plt.subplots(figsize=(max(6, 2 * n_strata), 5))
+    parts = ax.violinplot(filled, positions=list(range(n_strata)), showmedians=True)
+    bodies = cast(list, parts["bodies"])
+    for k, pc in enumerate(bodies):
+        pc.set_facecolor(plt.get_cmap("tab10")(k / max(n_strata - 1, 1)))
+        pc.set_alpha(0.6)
+    ax.set_xticks(range(n_strata))
+    ax.set_xticklabels([f"S{k}\n(n={len(data[k])})" for k in range(n_strata)])
+    ax.set_ylabel("Mean surface Cp")
+    ax.set_title("Cp distribution per shape stratum")
+    ax.grid(axis="y", lw=0.5, alpha=0.5)
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  Saved {out_path}")
+
+
+def plot_stratum_cp_profiles(
+    all_profiles: np.ndarray,   # (A, N_CHORD)  normalised chord-wise Cp
+    all_labels:   np.ndarray,   # (A,)
+    n_strata:     int,
+    p_mean:       float,
+    p_std:        float,
+    out_path:     Path,
+) -> None:
+    """Mean chord-wise Cp profile per stratum with ±1σ shaded band."""
+    x_chord = np.linspace(0.0, 1.0, all_profiles.shape[1])
+    cmap    = plt.get_cmap("tab10")
+
+    fig, ax = plt.subplots(figsize=(10, 5))
+    for k in range(n_strata):
+        m = all_labels == k
+        if m.sum() == 0:
+            continue
+        mean_p = all_profiles[m].mean(0) * p_std + p_mean
+        std_p  = all_profiles[m].std(0)  * p_std
+        c = cmap(k / max(n_strata - 1, 1))
+        ax.plot(x_chord, mean_p, color=c, lw=2, label=f"Stratum {k}  (n={m.sum()})")
+        ax.fill_between(x_chord, mean_p - std_p, mean_p + std_p, color=c, alpha=0.15)
+
+    ax.axhline(0.0, color="k", lw=0.5, ls="--")
+    ax.set_xlabel("Chord position  x/c")
+    ax.set_ylabel("Mean surface Cp")
+    ax.set_title("Chord-wise Cp profile per stratum  (shaded: ±1 std)")
+    ax.legend(loc="best", fontsize=9)
+    ax.grid(lw=0.4, alpha=0.4)
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  Saved {out_path}")
+
+
+def plot_shape_stratum(
+    all_shape:  np.ndarray,   # (A, 2*N_CHORD)
+    all_labels: np.ndarray,   # (A,)
+    all_cp:     np.ndarray,   # (A,)  normalised
+    n_strata:   int,
+    p_mean:     float,
+    p_std:      float,
+    out_path:   Path,
+) -> None:
+    """Geometric shape PCA coloured by stratum; inset r between shape PC1 and Cp.
+
+    Shows whether the strata discovered by the pressure lens correspond to
+    geometrically distinct shape families.
+    """
+    S_c  = all_shape - all_shape.mean(0)
+    _, _, Vt = np.linalg.svd(S_c, full_matrices=False)
+    coords   = S_c @ Vt[:2].T   # (A, 2)
+    cp_phys  = all_cp * p_std + p_mean
+
+    r_val, _ = pearsonr(coords[:, 0], cp_phys)
+
+    cmap = plt.get_cmap("tab10")
+    fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+
+    # Stratum colour
+    ax = axes[0]
+    for k in range(n_strata):
+        m = all_labels == k
+        ax.scatter(
+            coords[m, 0], coords[m, 1],
+            color=cmap(k / max(n_strata - 1, 1)),
+            s=45, alpha=0.85, edgecolors="k", linewidths=0.3,
+            label=f"S{k}",
+        )
+    ax.set_xlabel("Geometric shape PC 1  (thickness / camber)")
+    ax.set_ylabel("Geometric shape PC 2")
+    ax.set_title("Geometric shape space — coloured by pressure stratum")
+    ax.legend(loc="best", fontsize=9)
+    ax.grid(lw=0.3, alpha=0.4)
+    ax.annotate(
+        f"Shape PC1 vs Cp\nr = {r_val:+.3f}",
+        xy=(0.04, 0.96), xycoords="axes fraction",
+        va="top", ha="left", fontsize=9,
+        bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="#999", alpha=0.85),
+    )
+
+    # Cp colour
+    ax = axes[1]
+    sc = ax.scatter(
+        coords[:, 0], coords[:, 1],
+        c=cp_phys, cmap="RdBu_r",
+        s=45, edgecolors="k", linewidths=0.3, alpha=0.88,
+    )
+    fig.colorbar(sc, ax=ax, label="Mean surface Cp")
+    ax.set_xlabel("Geometric shape PC 1  (thickness / camber)")
+    ax.set_ylabel("Geometric shape PC 2")
+    ax.set_title("Geometric shape space — coloured by mean Cp")
+    ax.grid(lw=0.3, alpha=0.4)
+
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  Saved {out_path}")
+
+
+# ── Flow-condition filter ─────────────────────────────────────────────────────
+
+
+def _u_inf(graph: Data) -> float:
+    """Scalar inlet speed |U_inf| (m/s) from the first node's x features."""
+    ux = float(cast(torch.Tensor, graph.x)[0, 0])
+    uy = float(cast(torch.Tensor, graph.x)[0, 1])
+    return math.hypot(ux, uy)
+
+
+def filter_dataset_indices(
+    raw_ds:      AirfRANS,
+    reynolds:    float | None,
+    mach:        float | None,
+    reynolds_tol: float,
+    mach_tol:    float,
+) -> list[int]:
+    """Return indices whose Re and/or Ma are within tolerance of the targets.
+
+    Parameters
+    ----------
+    reynolds     : target Reynolds number (None = no Re filter)
+    mach         : target Mach number    (None = no Ma filter)
+    reynolds_tol : fractional tolerance, e.g. 0.05 → ±5 %
+    mach_tol     : fractional tolerance, e.g. 0.05 → ±5 %
+
+    Re and Ma are derived from the stored inlet velocity:
+      Re = ρ · |U_inf| · chord / μ
+      Ma = |U_inf| / c_sound
+    using standard sea-level air properties (_RHO, _MU, _C_SND, _CHORD).
+    """
+    kept: list[int] = []
+    for i in range(len(raw_ds)):
+        graph: Data = raw_ds[i]   # type: ignore[assignment]
+        U   = _u_inf(graph)
+        Re  = _RHO * U * _CHORD / _MU
+        Ma  = U / _C_SND
+
+        if reynolds is not None and abs(Re - reynolds) > reynolds_tol * reynolds:
+            continue
+        if mach is not None and abs(Ma - mach) > mach_tol * mach:
+            continue
+        kept.append(i)
+    return kept
 
 
 # ── Main training loop ────────────────────────────────────────────────────────
@@ -402,69 +724,87 @@ def train(args: argparse.Namespace) -> None:
     )
     print(f"Device: {device}")
 
-    # ── Load data ─────────────────────────────────────────────────────────────
-    # One AirfRANS instance per split, shared across every dataset view.
-    # PyG's AirfRANS is an InMemoryDataset — each extra instance duplicates
-    # the entire split in RAM.  Sharing also means KNN is built once per
-    # unique graph (edges land in the shared cache, not per-view copies).
+    # Update run.py's NEAR_FIELD_BOUNDS before any dataset construction
+    NEAR_FIELD_BOUNDS["y_min"] = -args.near_field_y
+    NEAR_FIELD_BOUNDS["y_max"] =  args.near_field_y
+
+    # ── Data ──────────────────────────────────────────────────────────────────
     print(f"Loading AirfRANS (task={args.task}) …")
     raw_train = AirfRANS(root=args.data_root, task=args.task, train=True)
     raw_test  = AirfRANS(root=args.data_root, task=args.task, train=False)
-    edge_cache_train: dict[int, torch.Tensor] = {}
-    edge_cache_test:  dict[int, torch.Tensor] = {}
 
-    n_total  = len(raw_train)
-    val_size = max(1, int(n_total * 0.1))
-    train_indices: list[int] = list(range(n_total - val_size))
-    val_indices:   list[int] = list(range(n_total - val_size, n_total))
+    # Optional flow-condition filter
+    re_filter = args.reynolds if args.reynolds > 0 else None
+    ma_filter = args.mach     if args.mach     > 0 else None
+    if re_filter is not None or ma_filter is not None:
+        label_parts: list[str] = []
+        if re_filter is not None:
+            label_parts.append(f"Re={re_filter:.3e} ±{args.reynolds_tol*100:.0f}%")
+        if ma_filter is not None:
+            label_parts.append(f"Ma={ma_filter:.4f} ±{args.mach_tol*100:.0f}%")
+        print(f"  Filtering by: {', '.join(label_parts)}")
 
-    print("  Computing normalisation stats (streaming) …")
-    norm_ds = AirfRANSDataset(
-        args.data_root, "train", task=args.task, knn_k=args.knn_k,
-        indices=train_indices,
-        _shared_raw=raw_train, _shared_edge_cache=edge_cache_train,
-    )
-    norm_stats = compute_normalisation_streaming(norm_ds)
-    del norm_ds
-    gc.collect()  # wrapper gone; shared raw + edge cache stay alive via train_edge_cache
-    _, _, y_mean, y_std = norm_stats
+        train_pool = filter_dataset_indices(
+            raw_train, re_filter, ma_filter, args.reynolds_tol, args.mach_tol
+        )
+        test_pool  = filter_dataset_indices(
+            raw_test,  re_filter, ma_filter, args.reynolds_tol, args.mach_tol
+        )
+        if len(train_pool) == 0:
+            raise ValueError(
+                "Flow-condition filter matched 0 training samples. "
+                "Widen --reynolds_tol / --mach_tol or adjust the target values."
+            )
+        print(
+            f"  Kept {len(train_pool)}/{len(raw_train)} train  "
+            f"{len(test_pool)}/{len(raw_test)} test"
+        )
+    else:
+        train_pool = list(range(len(raw_train)))
+        test_pool  = list(range(len(raw_test)))
 
-    train_dataset = AirfRANSDataset(
-        args.data_root, "train", task=args.task, knn_k=args.knn_k,
-        norm_stats=norm_stats, indices=train_indices,
-        _shared_raw=raw_train, _shared_edge_cache=edge_cache_train,
-    )
-    val_dataset = AirfRANSDataset(
-        args.data_root, "train", task=args.task, knn_k=args.knn_k,
-        norm_stats=norm_stats, indices=val_indices,
-        _shared_raw=raw_train, _shared_edge_cache=edge_cache_train,
-    )
-    test_dataset = AirfRANSDataset(
-        args.data_root, "test", task=args.task, knn_k=args.knn_k,
-        norm_stats=norm_stats,
-        _shared_raw=raw_test, _shared_edge_cache=edge_cache_test,
-    )
+    val_size  = max(1, int(len(train_pool) * 0.1))
+    train_idx = train_pool[: len(train_pool) - val_size]
+    val_idx   = train_pool[len(train_pool) - val_size :]
 
-    in_dim = train_dataset.in_dim
+    print("  Computing normalisation stats …")
+    x_mean, x_std, p_mean_t, p_std_t = compute_normalisation(raw_train, train_idx)
+    norm_stats = (x_mean, x_std, p_mean_t, p_std_t)
+    p_mean_v = float(p_mean_t)
+    p_std_v  = float(p_std_t)
+    print(f"  Pressure  mean={p_mean_v:.4f}  std={p_std_v:.4f}")
+
+    shared_cache: dict[int, GraphGrid] = {}
+    train_ds = AirfRANSNearFieldDataset(
+        args.data_root, "train", task=args.task,
+        norm_stats=norm_stats, indices=train_idx,
+        _shared_raw=raw_train, _shared_cache=shared_cache,
+    )
+    val_ds = AirfRANSNearFieldDataset(
+        args.data_root, "train", task=args.task,
+        norm_stats=norm_stats, indices=val_idx,
+        _shared_raw=raw_train, _shared_cache=shared_cache,
+    )
+    test_ds = AirfRANSNearFieldDataset(
+        args.data_root, "test", task=args.task,
+        norm_stats=norm_stats, indices=test_pool, _shared_raw=raw_test,
+    )
     print(
-        f"  {len(train_dataset)} train / {len(val_dataset)} val / "
-        f"{len(test_dataset)} test graphs, in_dim={in_dim}"
+        f"  {len(train_ds)} train / {len(val_ds)} val / {len(test_ds)} test\n"
+        f"  Grid {GRID_H}×{GRID_W}  Patches/airfoil: {N_PATCHES}"
     )
 
-    # ── Build model ────────────────────────────────────────────────────────────
-    model = StratifiedDQE(
-        in_dim=in_dim,
-        hidden_dim=args.hidden_dim,
-        embed_dim=args.embed_dim,
-        n_strata=args.n_strata,
-        n_intervals=args.n_intervals,
-        n_protos=args.n_protos,
-        n_targets=N_TARGETS,
-        n_layers=args.n_layers,
-        dropout=args.dropout,
-        K_max=args.K_max,
-        interval_temp=args.interval_temp,
-        proto_temp=args.proto_temp,
+    # ── Model ─────────────────────────────────────────────────────────────────
+    model = ShapeStratifiedDQE(
+        embed_dim     = args.embed_dim,
+        n_strata      = args.n_strata,
+        n_intervals   = args.n_intervals,
+        n_protos      = args.n_protos,
+        base_channels = args.base_channels,
+        dropout       = args.dropout,
+        K_max         = args.K_max,
+        interval_temp = args.interval_temp,
+        proto_temp    = args.proto_temp,
     ).to(device)
 
     if args.resume:
@@ -472,231 +812,162 @@ def train(args: argparse.Namespace) -> None:
         model.load_state_dict(ckpt["model"])
         print(f"Resumed from {args.resume}")
 
-    y_mean = y_mean.to(device)
-    y_std = y_std.to(device)
-
-    # History dicts
     history: dict[str, list[float]] = {
-        "total": [],
-        "regression": [],
-        "entropy": [],
-        "diversity": [],
-        "centripetal": [],
+        k: [] for k in ["total", "regression", "entropy", "diversity", "centripetal"]
     }
     kappa_hist: list[list[float]] = []
-    phase_boundaries: list[int] = []
 
-    # ── Phase 1: Warmup regressor ──────────────────────────────────────────────
-    print(f"\n=== Phase 1: Warmup regressor ({args.warmup_epochs} epochs) ===")
+    # ── Phase 1: Warmup ────────────────────────────────────────────────────────
+    print(f"\n=== Phase 1: Warmup ({args.warmup_epochs} epochs) ===")
     model.set_phase(1)
     opt1 = AdamW(
         [p for p in model.parameters() if p.requires_grad],
-        lr=args.lr,
-        weight_decay=1e-4,
+        lr=args.lr, weight_decay=1e-4,
     )
     sched1 = CosineAnnealingLR(opt1, T_max=max(1, args.warmup_epochs))
 
-    for epoch in range(args.warmup_epochs):
+    for epoch in tqdm(range(args.warmup_epochs), desc="warmup", unit="ep"):
         model.train()
         ep_loss = 0.0
-        n_batches = 0
-        train_dataset.shuffle()
-        for data in train_dataset:
-            loader = make_neighbor_loader(data, args.batch_size, args.num_neighbors)
-            for batch in loader:
-                batch = batch.to(device)
-                n_seed = batch.batch_size
-                opt1.zero_grad()
-                pred_all = model.warmup_forward(batch.x, batch.edge_index)
-                loss = F.mse_loss(pred_all[:n_seed], batch.y[:n_seed])
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                opt1.step()
-                ep_loss += loss.item()
-                n_batches += 1
-            del loader  # release reference to full-graph tensors
+        train_ds.shuffle()
+        for gg in train_ds:
+            patches_d = gg.patches.to(device)
+            target_d  = get_airfoil_cp(gg).to(device)
+            opt1.zero_grad()
+            pred  = model.warmup_forward(patches_d)
+            loss  = F.mse_loss(pred, target_d)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            opt1.step()
+            ep_loss += loss.item()
+            del patches_d, target_d, pred
         sched1.step()
-        avg = ep_loss / max(1, n_batches)
         if (epoch + 1) % max(1, args.warmup_epochs // 5) == 0:
-            print(f"  [warmup] epoch {epoch + 1:3d}  loss={avg:.4f}")
+            print(f"  [warmup] epoch {epoch + 1:3d}  loss={ep_loss / len(train_ds):.4f}")
 
-    phase_boundaries.append(args.warmup_epochs)
-
-    # ── Phase 2: K-means initialisation ───────────────────────────────────────
+    # ── Phase 2: K-means ───────────────────────────────────────────────────────
     print("\n=== Phase 2: K-means clustering ===")
-    torch.cuda.empty_cache()  # reclaim optimizer-state cache from Phase 1
-    all_embeds = collect_embeddings(model, train_dataset, device, args.max_embed_nodes)
-    centres, labels = kmeans_cluster(all_embeds, args.n_strata, seed=args.seed)
-    model.init_from_kmeans(centres, labels, all_embeds)  # all stay on CPU
-    print(
-        f"  Cluster sizes: {[(labels == k).sum().item() for k in range(args.n_strata)]}"
-    )
+    torch.cuda.empty_cache()
+    all_embeds_kmeans = collect_pooled_embeddings(model, train_ds, device)
+    centres, labels   = kmeans_cluster(all_embeds_kmeans, args.n_strata, seed=args.seed)
+    model.init_from_kmeans(centres, labels, all_embeds_kmeans)
+    sizes = [(labels == k).sum().item() for k in range(args.n_strata)]
+    print(f"  Cluster sizes: {sizes}")
 
-    # Centroids on device — used as pseudo-label source throughout Phase 3.
-    centres_gpu = centres.to(device)  # (K, d)
-
-    # ── Phase 3: Stratum assigner pre-train ───────────────────────────────────
-    print(f"\n=== Phase 3: Stratum assigner ({args.assigner_epochs} epochs) ===")
+    # ── Phase 3: Assigner pre-train ────────────────────────────────────────────
+    print(f"\n=== Phase 3: Assigner pre-train ({args.assigner_epochs} epochs) ===")
     model.set_phase(2)
     opt2 = AdamW(
         [p for p in model.parameters() if p.requires_grad],
-        lr=args.lr * 2,
-        weight_decay=1e-4,
+        lr=args.lr * 2, weight_decay=1e-4,
     )
+    centres_d = centres.to(device)
 
-    for epoch in range(args.assigner_epochs):
+    for epoch in tqdm(range(args.assigner_epochs), desc="assigner", unit="ep"):
         model.train()
         ep_loss = 0.0
-        n_batches = 0
-        train_dataset.shuffle()
-        for data in train_dataset:
-            loader = make_neighbor_loader(data, args.batch_size, args.num_neighbors)
-            for batch in loader:
-                batch = batch.to(device)
-                n_seed = batch.batch_size
-                opt2.zero_grad()
-                with torch.no_grad():
-                    emb_all = model.encode(batch.x, batch.edge_index)
-                    emb = emb_all[:n_seed]
-                    # Derive pseudo-labels from k-means centroids for seed nodes.
-                    diff = emb.unsqueeze(1) - centres_gpu.unsqueeze(0)  # (N, K, d)
-                    pseudo_labels = (diff**2).sum(-1).argmin(dim=-1)  # (N,)
-                soft = model.assigner(emb)
-                loss = F.nll_loss(soft.clamp(min=1e-8).log(), pseudo_labels)
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                opt2.step()
-                ep_loss += loss.item()
-                n_batches += 1
-            del loader
+        train_ds.shuffle()
+        for gg in train_ds:
+            patches_d = gg.patches.to(device)
+            opt2.zero_grad()
+            with torch.no_grad():
+                g = model.pool_patches(patches_d)
+                diff = g - centres_d.unsqueeze(0)    # (1, K, d)
+                pseudo = (diff ** 2).sum(-1).argmin(-1)  # (1,)
+            soft = model.assigner(g.detach())
+            loss = F.nll_loss(soft.clamp(1e-8).log(), pseudo)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            opt2.step()
+            ep_loss += loss.item()
+            del patches_d, g, soft
         if (epoch + 1) % max(1, args.assigner_epochs // 5) == 0:
-            print(
-                f"  [assigner] epoch {epoch + 1:3d}  ce={ep_loss / max(1, n_batches):.4f}"
-            )
-
-    phase_boundaries.append(args.warmup_epochs + args.assigner_epochs)
+            print(f"  [assigner] epoch {epoch + 1:3d}  ce={ep_loss / len(train_ds):.4f}")
 
     # ── Phase 4: Full joint training ───────────────────────────────────────────
     print(f"\n=== Phase 4: Full joint training ({args.full_epochs} epochs) ===")
     model.set_phase(3)
     opt3 = AdamW(
         [p for p in model.parameters() if p.requires_grad],
-        lr=args.lr,
-        weight_decay=1e-4,
+        lr=args.lr, weight_decay=1e-4,
     )
     sched3 = CosineAnnealingLR(opt3, T_max=max(1, args.full_epochs))
 
     best_val_mse = math.inf
-    best_epoch = 0
+    best_epoch   = 0
 
-    for epoch in range(args.full_epochs):
+    epoch_bar = tqdm(range(args.full_epochs), desc="full DQE", unit="ep")
+    for epoch in epoch_bar:
         model.train()
-        ep_break: dict[str, float] = {k: 0.0 for k in history}
-        train_dataset.shuffle()
+        ep: dict[str, float] = {k: 0.0 for k in history}
+        train_ds.shuffle()
 
-        n_batches = 0
-        for data in train_dataset:
-            loader = make_neighbor_loader(data, args.batch_size, args.num_neighbors)
-            for batch in loader:
-                batch = batch.to(device)
-                n_seed = batch.batch_size
-                opt3.zero_grad()
+        for gg in train_ds:
+            patches_d = gg.patches.to(device)
+            target_d  = get_airfoil_cp(gg).to(device)
 
-                # WTA routing: random subset of steps when mode='wta'
-                use_wta_step = (
-                    args.specialization_mode == "wta"
-                    and random.random() < args.wta_fraction
-                )
-                (
-                    pred_all,
-                    soft_assign_all,
-                    embeds_all,
-                    protos_tan,
-                    kappas,
-                    preds_stack_all,
-                ) = model(batch.x, batch.edge_index, use_wta=use_wta_step)
-                # Slice to seed nodes — neighbor nodes provide message-passing
-                # context only and must not contribute to the loss.
-                pred = pred_all[:n_seed]
-                soft_assign = soft_assign_all[:n_seed]
-                embeds = embeds_all[:n_seed]
-                preds_stack = preds_stack_all[:n_seed]  # (n_seed, K, T)
+            opt3.zero_grad()
+            pred, soft, g, protos_tan, kappas_t = model(patches_d)
 
-                # Aggregate protos to (K, d) for centripetal_loss.
-                protos_mean = protos_tan.mean(dim=1)  # (K, d)
+            l_reg  = F.mse_loss(pred, target_d)
+            l_ent  = stratum_entropy_loss(soft)
+            l_div  = curvature_diversity_loss(kappas_t, args.curvature_margin)
+            # Centripetal: pull airfoil embedding toward its expected prototype
+            protos_mean = protos_tan.mean(dim=1)          # (K, d)
+            l_cent = centripetal_loss(g, protos_mean, soft)
 
-                loss, breakdown = total_loss(
-                    pred=pred,
-                    target=batch.y[:n_seed],
-                    surf_mask=batch.surf[:n_seed],
-                    soft_assign=soft_assign,
-                    embeds_tan=embeds,
-                    protos_tan=protos_mean,
-                    kappas=kappas,
-                    surf_weight=args.surf_weight,
-                    entropy_weight=args.entropy_weight,
-                    diversity_weight=args.diversity_weight,
-                    centripetal_weight=args.centripetal_weight,
-                    curvature_margin=args.curvature_margin,
-                )
+            loss = (
+                l_reg
+                + args.entropy_weight     * l_ent
+                + args.diversity_weight   * l_div
+                + args.centripetal_weight * l_cent
+            )
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            opt3.step()
 
-                # Optional specialization loss (options 1 and 3; option 2 is
-                # the WTA routing already applied above).
-                if args.specialization_mode == "diversity":
-                    loss = (
-                        loss
-                        + args.specialization_weight
-                        * prediction_diversity_loss(preds_stack)
-                    )
-                elif args.specialization_mode == "cond_entropy":
-                    loss = (
-                        loss
-                        + args.specialization_weight
-                        * conditional_diversity_loss(preds_stack, soft_assign)
-                    )
-
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                opt3.step()
-
-                for k, v in breakdown.items():
-                    ep_break[k] = ep_break.get(k, 0.0) + v
-                n_batches += 1
-            del loader  # release reference to full-graph tensors
+            ep["regression"]  += l_reg.item()
+            ep["entropy"]     += l_ent.item()
+            ep["diversity"]   += l_div.item()
+            ep["centripetal"] += l_cent.item()
+            ep["total"]       += loss.item()
+            del patches_d, target_d, pred, soft, g, protos_tan
 
         sched3.step()
-
+        ng = max(1, len(train_ds))
         for k in history:
-            history[k].append(ep_break[k] / max(1, n_batches))
+            history[k].append(ep[k] / ng)
 
-        with torch.no_grad():
-            kappas_now = [
-                dqe.kappa.item()  # type: ignore[union-attr]
-                for dqe in model.dqes
-                if isinstance(dqe, StratumDQE)
-            ]
+        kappas_now = [
+            dqe.kappa.item() for dqe in model.dqes if isinstance(dqe, StratumDQE)
+        ]
         kappa_hist.append(kappas_now)
+
+        epoch_bar.set_postfix(
+            reg=f"{history['regression'][-1]:.4f}",
+            ent=f"{history['entropy'][-1]:.4f}",
+        )
 
         if (epoch + 1) % max(1, args.full_epochs // 10) == 0:
             torch.cuda.empty_cache()
-            val_metrics = evaluate(
-                model, val_dataset, device, y_mean, y_std, surf_weight=args.surf_weight
+            val_m = evaluate(model, val_ds, device)
+            epoch_bar.write(
+                f"  epoch {epoch + 1:3d}  "
+                f"val_mse={val_m['mse']:.4f}  val_r2={val_m['r2']:.3f}  "
+                f"κ={[f'{k:.2f}' for k in kappas_now]}"
             )
-            print(
-                f"  [full] epoch {epoch + 1:3d}  "
-                f"total={history['total'][-1]:.4f}  "
-                f"val_mse={val_metrics['weighted_mse']:.4f}  "
-                f"val_r2={val_metrics['r2_mean']:.3f}  "
-                f"kappas={[f'{k:.3f}' for k in kappas_now]}"
-            )
-            if val_metrics["weighted_mse"] < best_val_mse:
-                best_val_mse = val_metrics["weighted_mse"]
-                best_epoch = epoch + 1
+            if val_m["mse"] < best_val_mse:
+                best_val_mse = val_m["mse"]
+                best_epoch   = epoch + 1
                 torch.save(
                     {
                         "model": model.state_dict(),
                         "epoch": epoch + 1,
-                        "val_metrics": val_metrics,
+                        "val_metrics": val_m,
+                        "norm_stats": {
+                            "x_mean": x_mean.cpu(), "x_std": x_std.cpu(),
+                            "p_mean": p_mean_t.cpu(), "p_std": p_std_t.cpu(),
+                        },
                     },
                     out_dir / "checkpoint.pt",
                 )
@@ -707,61 +978,70 @@ def train(args: argparse.Namespace) -> None:
     print("\n=== Final evaluation on test set ===")
     ckpt = torch.load(out_dir / "checkpoint.pt", map_location=device)
     model.load_state_dict(ckpt["model"])
-
     torch.cuda.empty_cache()
-    test_metrics = evaluate(
-        model, test_dataset, device, y_mean, y_std, surf_weight=args.surf_weight
-    )
-    print("Test metrics:")
-    for k, v in test_metrics.items():
-        print(f"  {k}: {v:.4f}")
 
+    test_m = evaluate(model, test_ds, device)
+    for k, v in test_m.items():
+        print(f"  {k}: {v:.4f}")
     with open(out_dir / "test_metrics.json", "w") as f:
-        json.dump(test_metrics, f, indent=2)
+        json.dump(test_m, f, indent=2)
+
+    # ── Collect representations ────────────────────────────────────────────────
+    print("\n=== Collecting representations for visualisation ===")
+    torch.cuda.empty_cache()
+    model.eval()
+
+    embs_tr, softs_tr, cps_tr = collect_airfoil_embeddings(model, train_ds, device)
+    embs_va, softs_va, cps_va = collect_airfoil_embeddings(model, val_ds,   device)
+    embs_te, softs_te, cps_te = collect_airfoil_embeddings(model, test_ds,  device)
+
+    all_embs   = torch.cat([embs_tr, embs_va, embs_te]).numpy().astype(np.float64)
+    all_softs  = torch.cat([softs_tr, softs_va, softs_te]).numpy()
+    all_cps    = torch.cat([cps_tr, cps_va, cps_te]).numpy()
+    all_labels = all_softs.argmax(axis=1)   # hard stratum assignments
+    print(f"  {len(all_labels)} airfoils  embed_dim={all_embs.shape[1]}")
+
+    # Geometric shape vectors
+    print("  Computing geometric shape vectors …")
+    shape_tr = collect_shape_vectors(raw_train, train_ds)
+    shape_va = collect_shape_vectors(raw_train, val_ds)
+    shape_te = collect_shape_vectors(raw_test,  test_ds)
+    all_shape = np.concatenate([shape_tr, shape_va, shape_te])
+
+    # Chord-wise Cp profiles
+    print("  Computing chord-wise Cp profiles …")
+    prof_tr = collect_cp_profiles(raw_train, train_ds, p_mean_v, p_std_v)
+    prof_va = collect_cp_profiles(raw_train, val_ds,   p_mean_v, p_std_v)
+    prof_te = collect_cp_profiles(raw_test,  test_ds,  p_mean_v, p_std_v)
+    all_profiles = np.concatenate([prof_tr, prof_va, prof_te])
 
     # ── Visualisations ─────────────────────────────────────────────────────────
-    print("\nSaving visualisations …")
+    print("\n=== Saving visualisations ===")
 
-    plot_training_curves(
-        history,
-        out_dir / "training_curves.png",
-        phase_boundaries=phase_boundaries,
+    plot_training_curves(history, kappa_hist, out_dir)
+
+    plot_stratum_scatter(
+        all_embs, all_labels, all_cps,
+        args.n_strata, p_mean_v, p_std_v,
+        out_dir / "stratum_scatter.png",
+    )
+    plot_stratum_distributions(
+        all_labels, all_cps,
+        args.n_strata, p_mean_v, p_std_v,
+        out_dir / "stratum_distributions.png",
+    )
+    plot_stratum_cp_profiles(
+        all_profiles, all_labels,
+        args.n_strata, p_mean_v, p_std_v,
+        out_dir / "stratum_cp_profiles.png",
+    )
+    plot_shape_stratum(
+        all_shape, all_labels, all_cps,
+        args.n_strata, p_mean_v, p_std_v,
+        out_dir / "shape_stratum.png",
     )
 
-    if kappa_hist:
-        plot_curvature_evolution(kappa_hist, out_dir / "curvature_evolution.png")
-
-    # Stratum assignment plot (first test sample, no subsampling)
-    sample = test_dataset[0].to(device)
-    assert sample.x is not None and sample.edge_index is not None
-    model.eval()
-    with torch.no_grad():
-        embeds_vis = model.encode(sample.x, sample.edge_index)
-        asgn_vis = model.assigner.hard_assignments(embeds_vis)
-        pred_vis, _, _, _, _, _ = model(sample.x, sample.edge_index)
-
-    plot_stratum_assignments(
-        embeds_vis,
-        asgn_vis,
-        out_dir / "stratum_assignments.png",
-        surf_mask=sample.surf,
-    )
-
-    plot_prediction_scatter(
-        pred_vis,
-        cast(torch.Tensor, sample.y),
-        out_dir / "prediction_scatter.png",
-        surf_mask=sample.surf,
-    )
-
-    final_kappas = [
-        dqe.kappa.item()  # type: ignore[union-attr]
-        for dqe in model.dqes
-        if isinstance(dqe, StratumDQE)
-    ]
-    plot_geometry_summary(final_kappas, out_dir / "geometry_summary.png")
-
-    print(f"All outputs saved to {out_dir}")
+    print(f"\nAll outputs saved to {out_dir}")
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
@@ -769,125 +1049,57 @@ def train(args: argparse.Namespace) -> None:
 
 def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Train StratifiedDQE on AirfRANS",
+        description="Shape-Stratified DQE for AirfRANS — pressure-supervised shape clustering",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-
     # Data
-    p.add_argument(
-        "--data_root", default="../data/AirfRANS", help="AirfRANS download dir"
-    )
-    p.add_argument(
-        "--task",
-        default="scarce",
-        choices=["scarce", "full"],
-        help=(
-            "AirfRANS task variant.  'scarce' (~200 train sims, fits easily in memory) "
-            "is the default.  'full' (~800 train sims) needs more disk and RAM."
-        ),
-    )
-    p.add_argument("--knn_k", type=int, default=8, help="KNN graph edges per node")
-    p.add_argument(
-        "--batch_size",
-        type=int,
-        default=2048,
-        help="Seed nodes per NeighborLoader mini-batch during training",
-    )
-    p.add_argument(
-        "--num_neighbors",
-        type=lambda s: [int(x) for x in s.split(",")],
-        default=[25, 10, 10, 10],
-        help="Neighbor fanout per GNN hop, comma-separated (e.g. '25,10,10,10'). "
-        "Length should match --n_layers.",
-    )
-
+    p.add_argument("--data_root",    default="../data/AirfRANS")
+    p.add_argument("--task",         default="scarce", choices=["scarce", "full"])
+    p.add_argument("--near_field_y", type=float, default=0.6,
+                   help="Half-height of near-field domain; must match run.py")
     # Model
-    p.add_argument("--n_strata", type=int, default=4, help="Number of strata K")
-    p.add_argument("--hidden_dim", type=int, default=128, help="GNN hidden dimension")
-    p.add_argument("--embed_dim", type=int, default=64, help="Embedding dimension d")
+    p.add_argument("--n_strata",      type=int,   default=4)
+    p.add_argument("--embed_dim",     type=int,   default=64)
+    p.add_argument("--n_intervals",   type=int,   default=8)
+    p.add_argument("--n_protos",      type=int,   default=8)
+    p.add_argument("--base_channels", type=int,   default=32,
+                   help="GeometricConvAutoencoder base filter count")
+    p.add_argument("--dropout",       type=float, default=0.1)
+    p.add_argument("--K_max",         type=float, default=2.0)
+    p.add_argument("--interval_temp", type=float, default=0.5)
+    p.add_argument("--proto_temp",    type=float, default=1.0)
+    # Training
+    p.add_argument("--warmup_epochs",   type=int,   default=30)
+    p.add_argument("--assigner_epochs", type=int,   default=10)
+    p.add_argument("--full_epochs",     type=int,   default=100)
+    p.add_argument("--lr",              type=float, default=3e-4)
+    # Loss
+    p.add_argument("--entropy_weight",     type=float, default=0.1)
+    p.add_argument("--diversity_weight",   type=float, default=0.05)
+    p.add_argument("--centripetal_weight", type=float, default=0.01)
+    p.add_argument("--curvature_margin",   type=float, default=0.1)
+    # Flow-condition filter (0 = disabled)
     p.add_argument(
-        "--n_intervals", type=int, default=8, help="DQE intervals per stratum"
-    )
-    p.add_argument("--n_protos", type=int, default=8, help="DQE prototypes per stratum")
-    p.add_argument("--n_layers", type=int, default=4, help="GNN layers")
-    p.add_argument("--dropout", type=float, default=0.1, help="Dropout rate")
-    p.add_argument("--K_max", type=float, default=2.0, help="Max |curvature|")
-    p.add_argument(
-        "--interval_temp", type=float, default=0.5, help="Interval softmax temperature"
-    )
-    p.add_argument(
-        "--proto_temp", type=float, default=1.0, help="Prototype softmax temperature"
-    )
-
-    # Training phases
-    p.add_argument("--warmup_epochs", type=int, default=30, help="Phase 1 epochs")
-    p.add_argument("--assigner_epochs", type=int, default=10, help="Phase 3 epochs")
-    p.add_argument("--full_epochs", type=int, default=100, help="Phase 4 epochs")
-    p.add_argument("--lr", type=float, default=3e-4, help="Learning rate")
-
-    # Loss weights
-    p.add_argument(
-        "--surf_weight", type=float, default=10.0, help="Surface node loss weight"
+        "--reynolds", type=float, default=0,
+        help="Target Reynolds number; 0 = no filter  (e.g. 3e6)",
     )
     p.add_argument(
-        "--entropy_weight", type=float, default=0.1, help="Stratum entropy loss weight"
+        "--reynolds_tol", type=float, default=0.05,
+        help="Fractional tolerance for Re filter  (default ±5%%)",
     )
     p.add_argument(
-        "--diversity_weight",
-        type=float,
-        default=0.05,
-        help="Curvature diversity weight",
+        "--mach", type=float, default=0,
+        help="Target Mach number; 0 = no filter  (e.g. 0.15)",
     )
     p.add_argument(
-        "--centripetal_weight", type=float, default=0.01, help="Centripetal loss weight"
+        "--mach_tol", type=float, default=0.05,
+        help="Fractional tolerance for Ma filter  (default ±5%%)",
     )
-    p.add_argument(
-        "--curvature_margin", type=float, default=0.1, help="Min curvature separation"
-    )
-
-    # Stratum specialization (experimental — off by default)
-    p.add_argument(
-        "--specialization_mode",
-        default="none",
-        choices=["none", "diversity", "wta", "cond_entropy"],
-        help=(
-            "Stratum specialization mechanism for Phase 4. "
-            "'diversity': adds prediction_diversity_loss (option 1). "
-            "'wta': straight-through hard routing on --wta_fraction of steps (option 2). "
-            "'cond_entropy': concentrated-assignment + diverse-prediction loss (option 3). "
-            "Note: 'cond_entropy' conflicts with --entropy_weight > 0 (set it to 0 for that mode)."
-        ),
-    )
-    p.add_argument(
-        "--specialization_weight",
-        type=float,
-        default=0.1,
-        help="Weight for specialization loss (modes: diversity, cond_entropy).",
-    )
-    p.add_argument(
-        "--wta_fraction",
-        type=float,
-        default=0.5,
-        help="Fraction of Phase 4 steps using hard WTA routing (mode: wta).",
-    )
-
     # Misc
-    p.add_argument("--out_dir", default="results/airfrans", help="Output directory")
-    p.add_argument("--seed", type=int, default=42)
-    p.add_argument(
-        "--max_embed_nodes",
-        type=int,
-        default=500_000,
-        help=(
-            "Max total nodes sampled from the training set for k-means "
-            "(budget is distributed evenly across graphs, so RAM stays bounded)."
-        ),
-    )
-    p.add_argument(
-        "--cpu", action="store_true", help="Force CPU even if CUDA available"
-    )
-    p.add_argument("--resume", default="", help="Path to checkpoint to resume from")
-
+    p.add_argument("--out_dir", default="results/shape_strata")
+    p.add_argument("--seed",    type=int, default=42)
+    p.add_argument("--cpu",     action="store_true")
+    p.add_argument("--resume",  default="", help="Checkpoint to resume from")
     return p.parse_args()
 
 
