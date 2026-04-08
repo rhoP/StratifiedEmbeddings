@@ -1,0 +1,55 @@
+# Python
+__pycache__/
+*__pycache__*
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+*.egg-info/
+dist/
+build/
+
+# Results and outputs
+*.vtu
+*.vtk
+*.csv
+*.dat
+*.plt
+
+# SU2 outputs
+history.*
+surface_flow.*
+solution.*
+restart_flow.*
+*.log
+
+# Config files (may contain local paths)
+su2_config.json
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+
+*.md 
+*.npy 
+*.pkl 
+*.pth 
+*.html
+
+results/ 
+wdir*/
+data/
+meshes/
+=======
+# Plots etc
+plots/

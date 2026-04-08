@@ -1,5 +1,5 @@
 """
-run.py — Pressure-DQE on near-airfoil patches → 3-D pressure-similarity surface.
+run.py — Joint Pressure+Shape DQE on near-airfoil patches → 3-D similarity surface.
 
 Differences from run_airfrans_cnn.py
 --------------------------------------
@@ -10,23 +10,30 @@ Near-field filtering
     full-domain bounds, so patches resolve boundary-layer and near-wake
     physics rather than far-field quiescent flow.
 
-Pressure-only lens
-    Only pressure (channel 2 of the AirfRANS 4-target output) is predicted.
-    The single DQE head learns an interval/prototype decomposition of the
-    pressure field; embeddings therefore encode pressure-distribution shape.
+Joint pressure + shape lens
+    Two DQE heads share a single CNN encoder:
+      - pressure_dqe: predicts mean patch pressure; intervals/prototypes
+        decompose the Cp distribution (suction peak, recovery, wake).
+      - shape_dqe: predicts mean patch SDF (signed-distance-to-surface);
+        intervals/prototypes decompose the airfoil geometry proximity,
+        capturing leading-edge radius, camber, and thickness distribution.
+    The shared encoder is forced to produce embeddings that are informative
+    for both tasks simultaneously.  Loss is weighted sum with --shape_weight.
 
 No stratification
-    StratumAssigner and k-means phase are removed.  One StratumDQE head
-    trains directly on pressure with two phases:
-      1. Warmup  — encoder + linear regression head (MSE on pressure)
-      2. Full    — encoder + StratumDQE (pressure MSE + centripetal)
+    StratumAssigner and k-means phase are removed.  Two StratumDQE heads
+    train directly on their targets with two phases:
+      1. Warmup  — encoder + two linear regression heads (MSE on p and SDF)
+      2. Full    — encoder + pressure_dqe + shape_dqe
+                   loss = surf-weighted p MSE + shape_weight × SDF MSE
+                          + centripetal + spread (for both DQE heads)
 
 3-D surface visualisation
-    After training, each airfoil's patch embeddings are averaged to give one
-    vector per airfoil.  PCA projects these to 2-D for the x-y plane; mean
-    surface pressure provides the z-axis.  A surface interpolated over the
-    scatter forms a "pressure landscape" where proximity reflects aerodynamic
-    similarity and height reflects mean pressure level.
+    After training, each airfoil is represented by the concatenated mean
+    interval-assignment vectors from both DQE heads, giving a joint
+    pressure-and-shape descriptor.  PCA projects to 2-D for the x-y plane;
+    mean surface pressure provides the z-axis.  Proximity on the x-y plane
+    reflects similarity in *both* aerodynamic loading and geometric shape.
 
 Usage
 -----
@@ -34,6 +41,9 @@ Usage
 
   # Quick smoke test
   python run.py --n_intervals 4 --n_protos 4 --warmup_epochs 5 --full_epochs 10
+
+  # Pressure-only (shape_weight=0 recovers original behaviour)
+  python run.py --shape_weight 0.0
 """
 
 from __future__ import annotations
@@ -43,10 +53,12 @@ import json
 import math
 import random
 import time
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import cast
 
+import matplotlib.gridspec as gridspec
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
@@ -54,6 +66,7 @@ from tqdm import tqdm
 import torch.nn as nn
 import torch.nn.functional as F
 from scipy.interpolate import griddata
+from scipy.stats import pearsonr
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch_geometric.datasets import AirfRANS
@@ -90,6 +103,9 @@ N_PATCHES: int = N_PATCHES_H * N_PATCHES_W  # 49
 
 IN_CHANNELS: int = 7   # pos(2) + AirfRANS x features(5)
 P_IDX: int = 2         # pressure index in AirfRANS y = (u_x, u_y, **p**, nu_t)
+SDF_IDX: int = 4       # SDF channel in x_aug = [x, y, u_x_inf, u_y_inf, SDF, nx, ny]
+
+N_CHORD: int = 128     # chord-wise interpolation points for shape vectors
 
 
 # ── Data container ────────────────────────────────────────────────────────────
@@ -364,17 +380,25 @@ class PatchCNNEncoder(nn.Module):
 
 
 class PressureDQEModel(nn.Module):
-    """CNN encoder + single DQE head predicting pressure.
+    """CNN encoder + dual DQE heads predicting pressure distribution and airfoil shape.
 
-    Removing stratification simplifies training to two phases:
-      Phase 1 — encoder + WarmupRegressor (plain MSE on pressure)
-      Phase 2 — full model: encoder + StratumDQE
-                loss = surf-weighted pressure MSE + centripetal
+    Two StratumDQE heads share a single CNN encoder:
+      - pressure_dqe: predicts mean patch Cp; intervals/prototypes decompose
+        the pressure distribution (suction peak, recovery, wake signature).
+      - shape_dqe: predicts mean patch SDF (signed-distance-to-surface);
+        intervals/prototypes decompose geometric proximity to the surface,
+        capturing leading-edge radius, camber, and thickness.
 
-    The StratumDQE's interval/prototype decomposition learns to partition the
-    pressure distribution into meaningful quantile regions.  Post-training,
-    ``encode()`` maps any set of airfoil patches to embeddings whose geometry
-    reflects pressure-distribution similarity.
+    Training phases:
+      Phase 1 — encoder + two WarmupRegressors (MSE on pressure and SDF)
+      Phase 2 — full model: encoder + pressure_dqe + shape_dqe
+                loss = surf-weighted pressure MSE
+                       + shape_weight × surf-weighted SDF MSE
+                       + centripetal + spread (both DQE heads)
+
+    Post-training, ``collect_airfoil_embeddings`` concatenates the mean
+    interval-assignment vectors from both heads into a joint descriptor that
+    encodes *both* aerodynamic loading and geometric shape.
     """
 
     def __init__(
@@ -392,7 +416,14 @@ class PressureDQEModel(nn.Module):
         super().__init__()
         self.embed_dim = embed_dim
         self.encoder = PatchCNNEncoder(in_channels, embed_dim, hidden_dim, dropout)
-        self.dqe = StratumDQE(
+        self.pressure_dqe = StratumDQE(
+            embed_dim, n_intervals, n_protos,
+            n_targets=1,
+            K_max=K_max,
+            interval_temp=interval_temp,
+            proto_temp=proto_temp,
+        )
+        self.shape_dqe = StratumDQE(
             embed_dim, n_intervals, n_protos,
             n_targets=1,
             K_max=K_max,
@@ -400,6 +431,7 @@ class PressureDQEModel(nn.Module):
             proto_temp=proto_temp,
         )
         self.warmup_head = WarmupRegressor(embed_dim, n_targets=1)
+        self.warmup_shape_head = WarmupRegressor(embed_dim, n_targets=1)
 
     def set_phase(self, phase: int) -> None:
         for p in self.parameters():
@@ -409,6 +441,8 @@ class PressureDQEModel(nn.Module):
                 p.requires_grad_(True)
             for p in self.warmup_head.parameters():
                 p.requires_grad_(True)
+            for p in self.warmup_shape_head.parameters():
+                p.requires_grad_(True)
         elif phase == 2:
             for p in self.parameters():
                 p.requires_grad_(True)
@@ -416,16 +450,33 @@ class PressureDQEModel(nn.Module):
     def encode(self, patches: torch.Tensor) -> torch.Tensor:
         return self.encoder(patches)
 
-    def warmup_forward(self, patches: torch.Tensor) -> torch.Tensor:
-        return self.warmup_head(self.encode(patches))
+    def warmup_forward(
+        self, patches: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Returns (pred_pressure (P,1), pred_sdf (P,1))."""
+        emb = self.encode(patches)
+        return self.warmup_head(emb), self.warmup_shape_head(emb)
 
     def forward(
         self, patches: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Returns (pred_pressure (P,1), embeds (P,d), iv_w (P,I), pr_w (P,P_proto))."""
+    ) -> tuple[
+        torch.Tensor, torch.Tensor, torch.Tensor,
+        torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor,
+    ]:
+        """Returns (p_pred, s_pred, emb, p_iv_w, p_pr_w, s_iv_w, s_pr_w).
+
+        p_pred  : (P, 1) predicted pressure
+        s_pred  : (P, 1) predicted SDF (shape)
+        emb     : (P, d) shared encoder embeddings
+        p_iv_w  : (P, I) pressure interval-assignment weights
+        p_pr_w  : (P, K) pressure prototype-assignment weights
+        s_iv_w  : (P, I) shape interval-assignment weights
+        s_pr_w  : (P, K) shape prototype-assignment weights
+        """
         emb = self.encode(patches)
-        pred, iv_w, pr_w = self.dqe(emb)
-        return pred, emb, iv_w, pr_w
+        p_pred, p_iv_w, p_pr_w = self.pressure_dqe(emb)
+        s_pred, s_iv_w, s_pr_w = self.shape_dqe(emb)
+        return p_pred, s_pred, emb, p_iv_w, p_pr_w, s_iv_w, s_pr_w
 
 
 # ── Evaluation ────────────────────────────────────────────────────────────────
@@ -468,7 +519,7 @@ def evaluate_pressure(
         p_norm_node, smask, node_grid_rc = dataset.get_node_pressure_eval(i)
 
         patches_d = gg.patches.to(device)
-        pred_patch, _, _, _ = model(patches_d)
+        pred_patch, _, _, _, _, _, _ = model(patches_d)
         pred_patch_cpu = pred_patch.squeeze(-1).cpu()  # (P,)
         del patches_d, pred_patch
 
@@ -504,13 +555,16 @@ def collect_airfoil_embeddings(
     dataset: AirfRANSNearFieldDataset,
     device: torch.device,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Return (A, n_intervals) interval histograms and (A,) mean surface pressure per airfoil.
+    """Return joint (A, 2*n_intervals) histograms and (A,) mean surface pressure per airfoil.
 
-    Each airfoil is represented by the mean interval-assignment vector across
-    its P patches — a pressure-quantile histogram in the DQE's learned interval
-    basis.  This preserves the distributional shape (suction peak location,
-    trailing-edge pressure recovery, upper/lower asymmetry) that mean-pooling
-    raw embeddings would discard.
+    Each airfoil is represented by the concatenation of:
+      - mean pressure interval-assignment vector (pressure-quantile histogram)
+      - mean shape interval-assignment vector (SDF-proximity histogram)
+
+    This joint descriptor captures both the aerodynamic loading distribution
+    (suction peak location, recovery, wake) and the geometric shape (leading-
+    edge radius, camber, thickness) so that proximity in the embedding space
+    reflects similarity in *both* pressure and geometry.
 
     Surface patches (patch_surf==True) determine the mean pressure used as the
     z-coordinate in the 3-D visualisation; falls back to all-patch mean if no
@@ -522,89 +576,200 @@ def collect_airfoil_embeddings(
 
     for i in tqdm(range(len(dataset)), desc="collect embeddings", leave=False, unit="graph"):
         gg = dataset[i]
-        _, _, iv_w, _ = model(gg.patches.to(device))  # iv_w: (P, n_intervals)
-        representations.append(iv_w.mean(0).cpu())    # (n_intervals,) — quantile histogram
+        # p_iv_w: pressure quantile histogram; s_iv_w: shape/SDF histogram
+        _, _, _, p_iv_w, _, s_iv_w, _ = model(gg.patches.to(device))
+        joint = torch.cat([p_iv_w.mean(0), s_iv_w.mean(0)], dim=0).cpu()  # (2*n_intervals,)
+        representations.append(joint)
 
         smask = gg.patch_surf
         p_vals = gg.patch_pressure
         mean_pressures.append(
             p_vals[smask].mean().item() if smask.any() else p_vals.mean().item()
         )
-        del iv_w
+        del p_iv_w, s_iv_w
 
     return torch.stack(representations), torch.tensor(mean_pressures)
+
+
+# ── Shape metric ──────────────────────────────────────────────────────────────
+
+
+def compute_shape_vector(surf_pos: np.ndarray) -> np.ndarray:
+    """Chord-wise [thickness(x), camber(x)] vector from airfoil surface nodes.
+
+    Parameters
+    ----------
+    surf_pos : (N_surf, 2) — (x, y) coordinates of surface nodes in physical space
+
+    Returns
+    -------
+    (2 * N_CHORD,) — stacked [thickness, camber] at N_CHORD chord stations,
+    chord-normalised to x ∈ [0, 1].  Returns zeros when the surface has fewer
+    than 10 nodes or a degenerate chord (< 1e-6).
+    """
+    if surf_pos.shape[0] < 10:
+        return np.zeros(2 * N_CHORD)
+
+    x, y = surf_pos[:, 0], surf_pos[:, 1]
+    chord = x.max() - x.min()
+    if chord < 1e-6:
+        return np.zeros(2 * N_CHORD)
+    x_n = (x - x.min()) / chord
+
+    y_mid = y.mean()
+    upper, lower = y >= y_mid, y < y_mid
+    if upper.sum() < 6 or lower.sum() < 6:
+        return np.zeros(2 * N_CHORD)
+
+    x_grid = np.linspace(0.0, 1.0, N_CHORD)
+    su = np.argsort(x_n[upper])
+    y_up = np.interp(x_grid, x_n[upper][su], y[upper][su])
+    sl = np.argsort(x_n[lower])
+    y_lo = np.interp(x_grid, x_n[lower][sl], y[lower][sl])
+
+    return np.concatenate([y_up - y_lo, (y_up + y_lo) / 2.0])
+
+
+def collect_shape_vectors(
+    raw_ds: AirfRANS,
+    dataset: AirfRANSNearFieldDataset,
+) -> np.ndarray:
+    """Collect (A, 2*N_CHORD) shape vectors in dataset order using parallel workers.
+
+    Surface positions are extracted in the main process (dataset access is not
+    picklable), then compute_shape_vector is farmed out to a process pool.
+    """
+    surf_positions: list[np.ndarray] = []
+    for i in tqdm(range(len(dataset)), desc="  surface nodes", leave=False, unit="g"):
+        raw_idx = dataset._indices[dataset._order[i]]
+        raw: Data = raw_ds[raw_idx]  # type: ignore[assignment]
+        pos = cast(torch.Tensor, raw.pos).float().numpy()
+        surf_mask = (
+            cast(torch.Tensor, raw.surf).bool().numpy()
+            if hasattr(raw, "surf") and raw.surf is not None
+            else np.zeros(pos.shape[0], dtype=bool)
+        )
+        surf_positions.append(pos[surf_mask])
+
+    with ProcessPoolExecutor() as pool:
+        vecs = list(tqdm(
+            pool.map(compute_shape_vector, surf_positions),
+            total=len(surf_positions),
+            desc="  shape vectors",
+            leave=False,
+            unit="g",
+        ))
+    return np.stack(vecs)
 
 
 # ── Visualisation ─────────────────────────────────────────────────────────────
 
 
-def visualize_pressure_surface(
-    embeddings: torch.Tensor,      # (A, d)
-    mean_pressures: torch.Tensor,  # (A,)  normalised
+def visualize_shape_pressure(
+    all_embs: np.ndarray,    # (A, d)   joint pressure+shape DQE embeddings
+    all_pvals: np.ndarray,   # (A,)     normalised mean surface pressure
+    all_shape: np.ndarray,   # (A, 2*N_CHORD) geometric shape vectors
     p_mean: float,
     p_std: float,
     out_path: Path,
 ) -> None:
-    """3-D pressure-similarity surface.
+    """Two-panel figure: joint embedding surface overlaid with shape, + shape space.
 
-    Axes
-    ----
-    x, y  —  first two principal components of the per-airfoil embedding space
-             (proximity = similar pressure-distribution shape)
-    z     —  de-normalised mean surface pressure coefficient Cp
+    Left (3-D)
+        Joint embedding PCA (x/y = PC1/PC2, z = mean surface Cp).
+        The surface mesh encodes mean Cp; scatter points are coloured by
+        geometric shape PC1.  Proximity on the x-y plane reflects similarity
+        in *both* pressure distribution and airfoil geometry (as learned by
+        the dual DQE heads).  If shape-similar airfoils cluster together, the
+        shape DQE head has successfully encoded geometry.
 
-    A surface fitted via cubic griddata over the airfoil scatter forms a
-    "Cp landscape": ridges and valleys reveal which regions of airfoil-design
-    space tend to have high or low surface pressure.
+    Right (2-D)
+        Geometric shape-PCA space (x/y = shape PC1/PC2), scatter coloured by
+        mean Cp.  Comparing left and right reveals how well the model's joint
+        embedding tracks geometric shape.
+
+    The Pearson correlation between joint embedding PC1 and geometric shape
+    PC1 is annotated on both panels.
     """
-    E = embeddings.numpy().astype(np.float64)
+    cp = all_pvals * p_std + p_mean  # de-normalise Cp
 
-    # PCA to 2D: centre → SVD → project onto first two right-singular vectors
-    E_c = E - E.mean(0)
-    _, _, Vt = np.linalg.svd(E_c, full_matrices=False)
-    coords = E_c @ Vt[:2].T  # (A, 2)
+    # PCA of joint embedding
+    E_c = all_embs - all_embs.mean(0)
+    _, _, Vt_e = np.linalg.svd(E_c, full_matrices=False)
+    e_coords = E_c @ Vt_e[:2].T  # (A, 2)
 
-    cp = mean_pressures.numpy() * p_std + p_mean  # de-normalise
+    # PCA of geometric shape vectors
+    S_c = all_shape - all_shape.mean(0)
+    _, _, Vt_s = np.linalg.svd(S_c, full_matrices=False)
+    s_coords = S_c @ Vt_s[:2].T  # (A, 2)
 
-    x, y, z = coords[:, 0], coords[:, 1], cp
+    r_val, p_val = pearsonr(e_coords[:, 0], s_coords[:, 0])
+    print(f"  Embedding PC1 vs Geometric shape PC1:  r = {r_val:+.3f}  (p = {p_val:.2e})")
 
-    # Interpolated surface over the scatter.
-    # "linear" avoids the oscillation artifacts and NaN interior regions that
-    # "cubic" produces on sparse irregular scatter.  NaN outside the convex
-    # hull is filled with the global mean so plot_surface has no holes.
-    xi = np.linspace(x.min(), x.max(), 60)
-    yi = np.linspace(y.min(), y.max(), 60)
+    xp, yp = e_coords[:, 0], e_coords[:, 1]
+    xs, ys = s_coords[:, 0], s_coords[:, 1]
+    shape_c = s_coords[:, 0]  # colour by geometric shape PC1
+    cp_min, cp_max = float(cp.min()), float(cp.max())
+
+    # Interpolate Cp surface over the embedding scatter
+    xi = np.linspace(xp.min(), xp.max(), 60)
+    yi = np.linspace(yp.min(), yp.max(), 60)
     Xi, Yi = np.meshgrid(xi, yi)
-    Zi = griddata((x, y), z, (Xi, Yi), method="linear")
-    Zi = np.where(np.isnan(Zi), np.nanmean(z), Zi)
+    Zi = griddata((xp, yp), cp, (Xi, Yi), method="linear")
+    Zi = np.where(np.isnan(Zi), np.nanmean(cp), Zi)
 
-    fig = plt.figure(figsize=(13, 9))
-    ax = fig.add_subplot(111, projection="3d")
+    fig = plt.figure(figsize=(19, 8))
+    gs = gridspec.GridSpec(
+        1, 2,
+        width_ratios=[1.45, 1],
+        wspace=0.08, left=0.04, right=0.97, top=0.93, bottom=0.07,
+    )
 
-    ax.plot_surface(
+    # ── Left: 3-D embedding surface coloured by geometric shape ───────────
+    ax3 = fig.add_subplot(gs[0], projection="3d")
+    ax3.plot_surface(
         Xi, Yi, Zi,
-        cmap="RdBu_r", alpha=0.50,
-        linewidth=0, antialiased=True,
+        cmap="RdBu_r", alpha=0.45, linewidth=0, antialiased=True,
+        vmin=cp_min, vmax=cp_max,
     )
-    sc = ax.scatter(
-        x, y, z,
-        c=z, cmap="RdBu_r",
-        s=40, depthshade=True,
-        edgecolors="k", linewidths=0.3,
-        zorder=5,
+    sc_shape = ax3.scatter(
+        xp, yp, zs=cp,
+        c=shape_c, cmap="viridis",
+        vmin=float(shape_c.min()), vmax=float(shape_c.max()),
+        s=45, depthshade=True, edgecolors="k", linewidths=0.3, zorder=5,
     )
-    fig.colorbar(sc, ax=ax, shrink=0.5, pad=0.1, label="Mean surface Cp")
+    fig.colorbar(sc_shape, ax=ax3, shrink=0.42, pad=0.04,
+                 label="Geometric shape PC 1  (thickness/camber mode)")
+    ax3.set_xlabel("Embedding PC 1", labelpad=6)
+    ax3.set_ylabel("Embedding PC 2", labelpad=6)
+    ax3.set_zlabel("Mean surface Cp", labelpad=6)
+    ax3.set_title(
+        "Joint pressure+shape embedding  ·  colour = geometric shape\n"
+        f"Embedding–geometry correlation:  r = {r_val:+.3f}",
+        fontsize=10, pad=10,
+    )
 
-    ax.set_xlabel("PC 1  (embedding similarity)")
-    ax.set_ylabel("PC 2")
-    ax.set_zlabel("Mean surface Cp")
-    ax.set_title(
-        "Airfoil pressure-similarity surface\n"
-        "Proximity on x-y plane → similar pressure distribution  ·  "
-        "Height → mean surface Cp"
+    # ── Right: 2-D geometric shape space coloured by Cp ───────────────────
+    ax2 = fig.add_subplot(gs[1])
+    sc_cp = ax2.scatter(
+        xs, ys, c=cp, cmap="RdBu_r",
+        vmin=cp_min, vmax=cp_max,
+        s=42, edgecolors="k", linewidths=0.3, alpha=0.88,
+    )
+    fig.colorbar(sc_cp, ax=ax2, shrink=0.78, label="Mean surface Cp")
+    ax2.set_xlabel("Geometric shape PC 1  (thickness/camber mode)")
+    ax2.set_ylabel("Geometric shape PC 2")
+    ax2.set_title("Geometric shape similarity", fontsize=10)
+    ax2.set_aspect("equal", adjustable="datalim")
+    ax2.grid(True, lw=0.4, alpha=0.4)
+    ax2.annotate(
+        f"Embedding–geometry\ncorrelation\nr = {r_val:+.3f}",
+        xy=(0.04, 0.96), xycoords="axes fraction",
+        va="top", ha="left", fontsize=9,
+        bbox=dict(boxstyle="round,pad=0.35", fc="white", ec="#999", alpha=0.85),
     )
 
-    plt.tight_layout()
+    out_path.parent.mkdir(parents=True, exist_ok=True)
     plt.savefig(out_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
     print(f"  Saved {out_path}")
@@ -691,7 +856,7 @@ def train(args: argparse.Namespace) -> None:
         print(f"Resumed from {args.resume}")
 
     history: dict[str, list[float]] = {
-        "total": [], "regression": [], "centripetal": [], "spread": [],
+        "total": [], "p_regression": [], "s_regression": [], "centripetal": [], "spread": [],
     }
 
     # ── Phase 1: Warmup ────────────────────────────────────────────────────
@@ -712,18 +877,19 @@ def train(args: argparse.Namespace) -> None:
 
         for gg in tqdm(train_ds, desc="  graphs", leave=False, unit="g"):
             patches_d = gg.patches.to(device)
-            targets_d = gg.patch_pressure.unsqueeze(-1).to(device)  # (P, 1)
+            p_targets_d = gg.patch_pressure.unsqueeze(-1).to(device)        # (P, 1)
+            s_targets_d = patches_d[:, SDF_IDX].mean(dim=(-1, -2)).unsqueeze(-1)  # (P, 1)
 
             opt1.zero_grad()
-            pred = model.warmup_forward(patches_d)
-            loss = F.mse_loss(pred, targets_d)
+            p_pred, s_pred = model.warmup_forward(patches_d)
+            loss = F.mse_loss(p_pred, p_targets_d) + args.shape_weight * F.mse_loss(s_pred, s_targets_d)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             opt1.step()
 
             ep_loss += loss.item()
             n_graphs += 1
-            del patches_d, targets_d, pred
+            del patches_d, p_targets_d, s_targets_d, p_pred, s_pred
 
         sched1.step()
         epoch_bar1.set_postfix(loss=f"{ep_loss / max(1, n_graphs):.4f}")
@@ -740,78 +906,95 @@ def train(args: argparse.Namespace) -> None:
     best_val_mse = math.inf
     best_epoch = 0
 
+    def _spread_loss(protos: torch.Tensor, margin: float) -> torch.Tensor:
+        """Hinge penalty repelling prototype pairs closer than margin."""
+        pdist = torch.cdist(protos, protos)
+        off = ~torch.eye(protos.shape[0], dtype=torch.bool, device=protos.device)
+        return F.relu(margin - pdist[off]).mean()
+
     epoch_bar2 = tqdm(range(args.full_epochs), desc="full DQE", unit="ep")
     for epoch in epoch_bar2:
         model.train()
-        ep_reg = ep_cent = 0.0
+        ep_p_reg = ep_s_reg = ep_cent = ep_spread = 0.0
         n_graphs = 0
         train_ds.shuffle()
-
-        ep_spread = 0.0
         for gg in tqdm(train_ds, desc="  graphs", leave=False, unit="g"):
             patches_d = gg.patches.to(device)
-            targets_d = gg.patch_pressure.unsqueeze(-1).to(device)  # (P, 1)
-            surf_d = gg.patch_surf.to(device)                        # (P,)
+            p_targets_d = gg.patch_pressure.unsqueeze(-1).to(device)        # (P, 1)
+            s_targets_d = patches_d[:, SDF_IDX].mean(dim=(-1, -2)).unsqueeze(-1)  # (P, 1)
+            surf_d = gg.patch_surf.to(device)                               # (P,)
 
             opt2.zero_grad()
-            pred, emb, _, pr_w = model(patches_d)
+            p_pred, s_pred, emb, _, p_pr_w, _, s_pr_w = model(patches_d)
 
-            # Surface-weighted pressure MSE
-            per_patch = F.mse_loss(pred, targets_d, reduction="none").squeeze(-1)
+            # Surface-weighted loss weights (same for both heads)
+            per_p = F.mse_loss(p_pred, p_targets_d, reduction="none").squeeze(-1)
+            per_s = F.mse_loss(s_pred, s_targets_d, reduction="none").squeeze(-1)
             w = torch.where(
                 surf_d,
-                torch.full_like(per_patch, args.surf_weight),
-                torch.ones_like(per_patch),
+                torch.full_like(per_p, args.surf_weight),
+                torch.ones_like(per_p),
             )
-            l_reg = (w * per_patch).sum() / w.sum()
+            l_reg_p = (w * per_p).sum() / w.sum()
+            l_reg_s = (w * per_s).sum() / w.sum()
 
-            # Centripetal: pull each patch embedding toward its expected DQE prototype.
-            # Detach pr_w to break the double-gradient path through protos_tan — the
-            # assignment weights act as a fixed target here, not a learnable gate.
-            expected_proto = pr_w.detach() @ model.dqe.protos_tan  # (P, d)
-            l_cent = F.mse_loss(emb, expected_proto)
+            # Centripetal: pull each patch embedding toward its expected prototype.
+            # Detach assignment weights to break the double-gradient through protos_tan.
+            p_expected = p_pr_w.detach() @ model.pressure_dqe.protos_tan  # (P, d)
+            s_expected = s_pr_w.detach() @ model.shape_dqe.protos_tan     # (P, d)
+            # Average centripetal over both heads so their gradients compete fairly
+            l_cent = 0.5 * (F.mse_loss(emb, p_expected) + F.mse_loss(emb, s_expected))
 
-            # Spread: repel prototypes from each other so they can't collapse to the mean.
-            # Hinge penalty fires when any pair is closer than proto_margin.
-            P_mat = model.dqe.protos_tan                           # (n_protos, d)
-            pdist = torch.cdist(P_mat, P_mat)                      # (n_protos, n_protos)
-            off_diag = ~torch.eye(P_mat.shape[0], dtype=torch.bool, device=P_mat.device)
-            l_spread = F.relu(args.proto_margin - pdist[off_diag]).mean()
+            # Spread: repel prototypes for each head independently
+            l_spread = 0.5 * (
+                _spread_loss(model.pressure_dqe.protos_tan, args.proto_margin)
+                + _spread_loss(model.shape_dqe.protos_tan, args.proto_margin)
+            )
 
-            loss = l_reg + args.centripetal_weight * l_cent + args.spread_weight * l_spread
+            loss = (
+                l_reg_p + args.shape_weight * l_reg_s
+                + args.centripetal_weight * l_cent
+                + args.spread_weight * l_spread
+            )
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             opt2.step()
 
-            ep_reg += l_reg.item()
+            ep_p_reg += l_reg_p.item()
+            ep_s_reg += l_reg_s.item()
             ep_cent += l_cent.item()
             ep_spread += l_spread.item()
             n_graphs += 1
-            del patches_d, targets_d, surf_d, pred, emb, pr_w
+            del patches_d, p_targets_d, s_targets_d, surf_d, p_pred, s_pred, emb, p_pr_w, s_pr_w
 
         sched2.step()
         ng = max(1, n_graphs)
-        history["regression"].append(ep_reg / ng)
+        history["p_regression"].append(ep_p_reg / ng)
+        history["s_regression"].append(ep_s_reg / ng)
         history["centripetal"].append(ep_cent / ng)
         history["spread"].append(ep_spread / ng)
         history["total"].append(
-            (ep_reg + args.centripetal_weight * ep_cent + args.spread_weight * ep_spread) / ng
+            (ep_p_reg + args.shape_weight * ep_s_reg
+             + args.centripetal_weight * ep_cent
+             + args.spread_weight * ep_spread) / ng
         )
 
         epoch_bar2.set_postfix(
-            reg=f"{history['regression'][-1]:.4f}",
+            p_reg=f"{history['p_regression'][-1]:.4f}",
+            s_reg=f"{history['s_regression'][-1]:.4f}",
             cent=f"{history['centripetal'][-1]:.4f}",
         )
 
         if (epoch + 1) % max(1, args.full_epochs // 10) == 0:
             torch.cuda.empty_cache()
             val_m = evaluate_pressure(model, val_ds, device, args.surf_weight)
-            kappa = model.dqe.kappa.item()
+            kappa_p = model.pressure_dqe.kappa.item()
+            kappa_s = model.shape_dqe.kappa.item()
             epoch_bar2.write(
                 f"  epoch {epoch + 1:3d}  "
                 f"val_mse={val_m['weighted_mse']:.4f}  "
                 f"val_r2={val_m['r2_pressure']:.3f}  "
-                f"kappa={kappa:.3f}"
+                f"κ_p={kappa_p:.3f}  κ_s={kappa_s:.3f}"
             )
             if val_m["weighted_mse"] < best_val_mse:
                 best_val_mse = val_m["weighted_mse"]
@@ -847,28 +1030,35 @@ def train(args: argparse.Namespace) -> None:
         json.dump(test_m, f, indent=2)
 
     # ── Collect embeddings & visualise ─────────────────────────────────────
-    print("\n=== Building 3-D pressure-similarity surface ===")
+    print("\n=== Collecting embeddings and building visualisations ===")
     torch.cuda.empty_cache()
 
-    # Embed all splits; combine for a denser surface (more airfoils = cleaner landscape)
+    # Joint DQE embeddings — combine all splits for a denser surface
     embs_train, pvals_train = collect_airfoil_embeddings(model, train_ds, device)
     embs_val, pvals_val = collect_airfoil_embeddings(model, val_ds, device)
     embs_test, pvals_test = collect_airfoil_embeddings(model, test_ds, device)
 
-    all_embs = torch.cat([embs_train, embs_val, embs_test], dim=0)
-    all_pvals = torch.cat([pvals_train, pvals_val, pvals_test], dim=0)
+    all_embs = torch.cat([embs_train, embs_val, embs_test], dim=0).numpy().astype(np.float64)
+    all_pvals = torch.cat([pvals_train, pvals_val, pvals_test], dim=0).numpy()
 
     print(f"  {all_embs.shape[0]} airfoils  embed_dim={all_embs.shape[1]}")
 
-    visualize_pressure_surface(
-        all_embs, all_pvals,
+    # Geometric shape vectors (chord-wise thickness/camber from surface nodes)
+    print("  Computing geometric shape vectors …")
+    shape_tr = collect_shape_vectors(raw_train, train_ds)
+    shape_va = collect_shape_vectors(raw_train, val_ds)
+    shape_te = collect_shape_vectors(raw_test, test_ds)
+    all_shape = np.concatenate([shape_tr, shape_va, shape_te])
+
+    visualize_shape_pressure(
+        all_embs, all_pvals, all_shape,
         p_mean=p_mean.item(), p_std=p_std.item(),
-        out_path=out_dir / "pressure_surface_3d.png",
+        out_path=out_dir / "shape_pressure_surface.png",
     )
 
     # Training curves
-    fig, axes = plt.subplots(1, 4, figsize=(20, 4))
-    for ax, key in zip(axes, ["total", "regression", "centripetal", "spread"]):
+    fig, axes = plt.subplots(1, 5, figsize=(25, 4))
+    for ax, key in zip(axes, ["total", "p_regression", "s_regression", "centripetal", "spread"]):
         ax.plot(history[key])
         ax.set_title(key)
         ax.set_xlabel("epoch (phase 2)")
@@ -917,6 +1107,8 @@ def _parse_args() -> argparse.Namespace:
     # Loss
     p.add_argument("--surf_weight", type=float, default=10.0,
                    help="Surface patch loss multiplier")
+    p.add_argument("--shape_weight", type=float, default=1.0,
+                   help="Weight on shape (SDF) task relative to pressure task; 0 = pressure-only")
     p.add_argument("--centripetal_weight", type=float, default=0.01,
                    help="Weight on centripetal (embed→prototype) regulariser")
     p.add_argument("--proto_margin", type=float, default=1.0,
